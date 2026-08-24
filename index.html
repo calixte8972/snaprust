@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>SnapRust</title>
+  </head>
+  <body>
+    <main id="capture-overlay" class="capture-overlay" aria-label="SnapRust 截图遮罩">
+      <img id="capture-image" class="capture-image" alt="当前屏幕截图" draggable="false" />
+      <div class="capture-shade capture-shade--top"></div>
+      <div class="capture-shade capture-shade--left"></div>
+      <div class="capture-shade capture-shade--right"></div>
+      <div class="capture-shade capture-shade--bottom"></div>
+      <div id="monitor-guides" class="monitor-guides" aria-hidden="true"></div>
+      <div id="selection-box" class="selection-box" aria-hidden="true">
+        <span id="selection-size" class="selection-size"></span>
+      </div>
+      <aside class="capture-hud" aria-live="polite">
+        <span id="capture-desktop"></span>
+        <span id="capture-pointer"></span>
+      </aside>
+      <section class="capture-hint" aria-live="polite">
+        <span class="capture-hint__brand">SnapRust</span>
+        <strong id="capture-status">正在准备截图…</strong>
+        <span>拖动选择区域 · Esc 或右键取消</span>
+      </section>
+      <section id="annotation-editor" class="annotation-editor" aria-label="截图标注编辑器" hidden>
+        <div class="annotation-toolbar" role="toolbar" aria-label="标注工具">
+          <button type="button" data-tool="arrow" class="annotation-tool is-active" title="箭头">↗</button>
+          <button type="button" data-tool="rectangle" class="annotation-tool" title="矩形">□</button>
+          <button type="button" data-tool="ellipse" class="annotation-tool" title="椭圆">○</button>
+          <button type="button" data-tool="brush" class="annotation-tool" title="画笔">✎</button>
+          <button type="button" data-tool="mosaic" class="annotation-tool" title="马赛克">▦</button>
+          <button type="button" data-tool="text" class="annotation-tool" title="文字">T</button>
+          <span class="annotation-toolbar__separator"></span>
+          <label class="annotation-color" title="颜色"><input id="annotation-color" type="color" value="#43d9a3" /></label>
+          <label class="annotation-width" title="粗细"><input id="annotation-width" type="range" min="1" max="32" value="4" /></label>
+          <span id="annotation-width-value" class="annotation-width-value">4 px</span>
+          <span class="annotation-toolbar__separator"></span>
+          <button id="annotation-undo" type="button" class="annotation-action" title="撤销 Ctrl+Z">↶</button>
+          <button id="annotation-redo" type="button" class="annotation-action" title="重做 Ctrl+Y">↷</button>
+          <button id="annotation-clear" type="button" class="annotation-action" title="清空标注">清空</button>
+          <span class="annotation-toolbar__spacer"></span>
+          <button id="annotation-pin" type="button" class="annotation-action annotation-action--primary" title="钉到桌面">📌 钉图</button>
+        </div>
+        <div id="annotation-canvas-wrap" class="annotation-canvas-wrap">
+          <canvas id="annotation-canvas" aria-label="截图标注画布"></canvas>
+          <div id="annotation-text-editor" class="annotation-text-editor" hidden>
+            <textarea id="annotation-text-input" maxlength="512" rows="3" placeholder="输入文字；Ctrl+Enter 确认" aria-label="文字标注内容"></textarea>
+            <div class="annotation-text-editor__actions">
+              <span>Ctrl+Enter 确认 · Esc 取消</span>
+              <button id="annotation-text-cancel" type="button" title="取消文字标注">取消</button>
+              <button id="annotation-text-confirm" type="button" title="确认文字标注">确认</button>
+            </div>
+          </div>
+        </div>
+        <div class="annotation-editor__footer">
+          <span id="annotation-status">标注会在复制时由 Rust 合成</span>
+          <span><kbd>Ctrl+C</kbd> 复制　<kbd>📌</kbd> 钉图　<kbd>Esc</kbd> 取消</span>
+        </div>
+      </section>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>

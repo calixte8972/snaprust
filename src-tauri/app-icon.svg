@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="SnapRust app icon">
+  <defs>
+    <linearGradient id="background" x1="64" y1="48" x2="448" y2="464" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#17222c"/>
+      <stop offset="1" stop-color="#070a0e"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="120" y1="96" x2="400" y2="424" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#6ee7bd"/>
+      <stop offset="1" stop-color="#22c58b"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" fill="url(#background)"/>
+  <path d="M132 188v-56h56M324 132h56v56M380 324v56h-56M188 380h-56v-56" fill="none" stroke="url(#accent)" stroke-width="32" stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="174" y="174" width="164" height="164" rx="30" fill="#22c58b" fill-opacity=".12" stroke="#f7f7f5" stroke-width="22"/>
+  <circle cx="256" cy="256" r="38" fill="url(#accent)"/>
+</svg>
