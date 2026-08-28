@@ -12,19 +12,65 @@
       <div class="capture-shade capture-shade--left"></div>
       <div class="capture-shade capture-shade--right"></div>
       <div class="capture-shade capture-shade--bottom"></div>
-      <div id="monitor-guides" class="monitor-guides" aria-hidden="true"></div>
       <div id="selection-box" class="selection-box" aria-hidden="true">
         <span id="selection-size" class="selection-size"></span>
       </div>
-      <aside class="capture-hud" aria-live="polite">
-        <span id="capture-desktop"></span>
-        <span id="capture-pointer"></span>
-      </aside>
-      <section class="capture-hint" aria-live="polite">
-        <span class="capture-hint__brand">SnapRust</span>
-        <strong id="capture-status">正在准备截图…</strong>
-        <span>拖动选择区域 · Esc 或右键取消</span>
+      <section id="settings-panel" class="settings-panel" aria-label="翻译设置" hidden>
+        <header class="settings-panel__header">
+          <div>
+            <span class="settings-panel__eyebrow">SNAPRUST</span>
+            <h1>翻译设置</h1>
+            <p>配置后，截图 OCR 文字才会发送到选定的 LLM 服务。</p>
+          </div>
+          <button id="settings-close" type="button" class="settings-close" title="关闭设置" aria-label="关闭设置">×</button>
+        </header>
+        <form id="translation-settings-form" class="settings-form">
+          <label>
+            <span>提供商</span>
+            <select id="settings-provider">
+              <option value="deepseek">DeepSeek</option>
+              <option value="openai">OpenAI</option>
+              <option value="openai-compatible">OpenAI 兼容网关</option>
+              <option value="ollama">Ollama（本地）</option>
+            </select>
+          </label>
+          <label>
+            <span id="settings-api-key-label">API Key</span>
+            <input id="settings-api-key" type="password" autocomplete="off" placeholder="请输入 API Key" />
+            <small id="settings-api-key-hint">尚未配置</small>
+          </label>
+          <label>
+            <span>模型</span>
+            <input id="settings-model" type="text" value="deepseek-v4-flash" spellcheck="false" placeholder="deepseek-v4-flash" />
+          </label>
+          <label>
+            <span>API 端点</span>
+            <input id="settings-endpoint" type="url" value="https://api.deepseek.com" spellcheck="false" />
+            <small>程序会请求端点下的 <code>/chat/completions</code>。</small>
+          </label>
+          <label class="settings-form__clear-key">
+            <input id="settings-clear-key" type="checkbox" /> 清除已保存的 API Key
+          </label>
+          <div class="settings-form__actions">
+            <span id="settings-status">API Key 只在用户点击翻译后使用。</span>
+            <button id="settings-test" type="button">保存并测试</button>
+            <button id="settings-save" type="submit" class="settings-form__primary">保存</button>
+          </div>
+        </form>
       </section>
+      <nav id="image-context-menu" class="image-context-menu" aria-label="截图操作" hidden>
+        <button type="button" data-image-action="copy">复制图片</button>
+        <button type="button" data-image-action="pin">钉图</button>
+        <button type="button" data-image-action="ocr">OCR 识别</button>
+        <button type="button" data-image-action="translate">OCR 并翻译</button>
+        <span class="image-context-menu__separator"></span>
+        <button type="button" data-image-action="crop">裁剪</button>
+        <button type="button" data-image-action="rotate-left">向左旋转 90°</button>
+        <button type="button" data-image-action="rotate-right">向右旋转 90°</button>
+        <button type="button" data-image-action="reset-rotation">重置旋转</button>
+        <span class="image-context-menu__separator"></span>
+        <button type="button" data-image-action="destroy" class="image-context-menu__danger">销毁截图</button>
+      </nav>
       <section id="annotation-editor" class="annotation-editor" aria-label="截图标注编辑器" hidden>
         <div class="annotation-toolbar" role="toolbar" aria-label="标注工具">
           <button type="button" data-tool="arrow" class="annotation-tool is-active" title="箭头">↗</button>
@@ -33,6 +79,7 @@
           <button type="button" data-tool="brush" class="annotation-tool" title="画笔">✎</button>
           <button type="button" data-tool="mosaic" class="annotation-tool" title="马赛克">▦</button>
           <button type="button" data-tool="text" class="annotation-tool" title="文字">T</button>
+          <button type="button" data-tool="crop" class="annotation-tool" title="裁剪图片">✂</button>
           <span class="annotation-toolbar__separator"></span>
           <label class="annotation-color" title="颜色"><input id="annotation-color" type="color" value="#43d9a3" /></label>
           <label class="annotation-width" title="粗细"><input id="annotation-width" type="range" min="1" max="32" value="4" /></label>
@@ -41,24 +88,127 @@
           <button id="annotation-undo" type="button" class="annotation-action" title="撤销 Ctrl+Z">↶</button>
           <button id="annotation-redo" type="button" class="annotation-action" title="重做 Ctrl+Y">↷</button>
           <button id="annotation-clear" type="button" class="annotation-action" title="清空标注">清空</button>
-          <span class="annotation-toolbar__spacer"></span>
-          <button id="annotation-pin" type="button" class="annotation-action annotation-action--primary" title="钉到桌面">📌 钉图</button>
         </div>
-        <div id="annotation-canvas-wrap" class="annotation-canvas-wrap">
-          <canvas id="annotation-canvas" aria-label="截图标注画布"></canvas>
-          <div id="annotation-text-editor" class="annotation-text-editor" hidden>
-            <textarea id="annotation-text-input" maxlength="512" rows="3" placeholder="输入文字；Ctrl+Enter 确认" aria-label="文字标注内容"></textarea>
-            <div class="annotation-text-editor__actions">
-              <span>Ctrl+Enter 确认 · Esc 取消</span>
-              <button id="annotation-text-cancel" type="button" title="取消文字标注">取消</button>
-              <button id="annotation-text-confirm" type="button" title="确认文字标注">确认</button>
+        <div class="annotation-workspace">
+          <div id="annotation-canvas-wrap" class="annotation-canvas-wrap">
+            <canvas id="annotation-canvas" aria-label="截图标注画布"></canvas>
+            <div id="annotation-text-editor" class="annotation-text-editor" hidden>
+              <textarea id="annotation-text-input" maxlength="512" rows="3" placeholder="输入文字；Ctrl+Enter 确认" aria-label="文字标注内容"></textarea>
+              <div class="annotation-text-editor__actions">
+                <span>Ctrl+Enter 确认 · Esc 取消</span>
+                <button id="annotation-text-cancel" type="button" title="取消文字标注">取消</button>
+                <button id="annotation-text-confirm" type="button" title="确认文字标注">确认</button>
+              </div>
             </div>
           </div>
+          <aside id="ocr-panel" class="ocr-panel" aria-label="OCR 识别结果" hidden>
+            <div class="ocr-panel__header">
+              <div>
+                <strong>文字识别</strong>
+                <span id="ocr-meta">等待识别</span>
+              </div>
+              <label class="ocr-panel__language" title="OCR 识别语言">
+                <span class="sr-only">OCR 识别语言</span>
+                <select id="ocr-language" aria-label="OCR 识别语言" disabled>
+                  <option value="">自动（系统）</option>
+                </select>
+              </label>
+              <button id="ocr-close" type="button" title="关闭识别结果" aria-label="关闭识别结果">×</button>
+            </div>
+            <textarea id="ocr-result" spellcheck="false" placeholder="识别出的文字会显示在这里，可直接修改" aria-label="可编辑的识别文字"></textarea>
+            <div id="ocr-lines" class="ocr-lines" aria-label="OCR 文本位置" hidden></div>
+             <div class="ocr-panel__actions">
+               <span>可编辑 · 悬停文字可定位图片</span>
+               <button id="ocr-copy" type="button" disabled>复制文字</button>
+             </div>
+             <div class="translation-panel">
+               <div class="translation-panel__header">
+                 <strong>翻译</strong>
+                 <label>
+                   <span class="sr-only">翻译模型</span>
+                   <select id="translation-model" aria-label="翻译模型" title="翻译模型">
+                     <option value="deepseek-v4-flash">DeepSeek V4 Flash</option>
+                   </select>
+                 </label>
+                 <label>
+                   <span class="sr-only">目标语言</span>
+                   <select id="translation-target" aria-label="翻译目标语言">
+                     <option value="zh-Hans">中文（简体）</option>
+                     <option value="en">English</option>
+                     <option value="ja">日本語</option>
+                     <option value="ko">한국어</option>
+                     <option value="ru">Русский</option>
+                     <option value="es">Español</option>
+                     <option value="fr">Français</option>
+                     <option value="de">Deutsch</option>
+                   </select>
+                 </label>
+                 <button id="translation-run" type="button" title="翻译当前 OCR 文字">翻译</button>
+               </div>
+               <textarea id="translation-result" readonly spellcheck="false" placeholder="翻译结果会显示在这里" aria-label="翻译结果"></textarea>
+               <div class="translation-panel__actions">
+                 <span id="translation-meta">需要配置翻译服务</span>
+                 <button id="translation-copy" type="button" disabled>复制译文</button>
+               </div>
+             </div>
+           </aside>
         </div>
         <div class="annotation-editor__footer">
           <span id="annotation-status">标注会在复制时由 Rust 合成</span>
-          <span><kbd>Ctrl+C</kbd> 复制　<kbd>📌</kbd> 钉图　<kbd>Esc</kbd> 取消</span>
+          <div id="annotation-crop-actions" class="annotation-crop-actions" hidden>
+            <span>拖动选择区域；应用后会清除已有标注</span>
+            <button id="annotation-crop-cancel" type="button" class="annotation-action">取消</button>
+            <button id="annotation-crop-apply" type="button" class="annotation-action annotation-action--primary" disabled>应用裁剪</button>
+          </div>
+          <div class="annotation-zoom-controls" role="group" aria-label="图片缩放">
+            <button id="annotation-zoom-out" type="button" class="annotation-zoom-button" title="缩小图片">−</button>
+            <label class="annotation-zoom-slider" title="缩放图片">
+              <span class="sr-only">图片缩放</span>
+              <input id="annotation-zoom" type="range" min="50" max="300" step="10" value="100" />
+            </label>
+            <span id="annotation-zoom-value" class="annotation-zoom-value">100%</span>
+            <button id="annotation-zoom-in" type="button" class="annotation-zoom-button" title="放大图片">+</button>
+            <button id="annotation-zoom-fit" type="button" class="annotation-zoom-fit" title="恢复适应窗口">适应</button>
+          </div>
+          <span class="annotation-editor__hints"><kbd>Ctrl+C</kbd> 复制图片 · <kbd>Esc</kbd> 取消</span>
+          <div class="annotation-editor__actions">
+            <button id="annotation-ocr" type="button" class="annotation-action" title="识别选区中的文字">OCR</button>
+            <button id="annotation-translate" type="button" class="annotation-action" title="识别并翻译选区中的文字">翻译</button>
+            <button id="annotation-pin" type="button" class="annotation-action annotation-action--primary" title="钉到桌面">📌 钉图</button>
+          </div>
         </div>
+      </section>
+      <section id="history-panel" class="history-panel" aria-label="截图历史" hidden>
+        <header class="history-panel__header">
+          <div>
+            <span class="history-panel__eyebrow">SNAPRUST</span>
+            <h1>截图历史</h1>
+            <p id="history-summary">正在读取本地截图…</p>
+          </div>
+          <button id="history-close" type="button" class="history-close" title="关闭历史（Esc）" aria-label="关闭截图历史">×</button>
+        </header>
+        <div class="history-panel__filters">
+          <label class="history-search">
+            <span class="sr-only">搜索 OCR 文字</span>
+            <input id="history-search" type="search" maxlength="256" placeholder="搜索 OCR 文字…" autocomplete="off" />
+          </label>
+          <label class="history-favorites"><input id="history-favorites" type="checkbox" /> 仅看收藏</label>
+          <span><kbd>Alt + H</kbd> 打开历史</span>
+        </div>
+        <div id="history-batch" class="history-batch" hidden>
+          <label class="history-batch__select-all"><input id="history-select-all" type="checkbox" /> 全选当前结果</label>
+          <span id="history-selected-count">已选择 0 项</span>
+          <span class="history-batch__spacer"></span>
+          <button id="history-batch-favorite" type="button">收藏</button>
+          <button id="history-batch-unfavorite" type="button">取消收藏</button>
+          <button id="history-batch-export" type="button" title="导出 PNG 图片和 CSV 元数据">导出</button>
+          <button id="history-batch-delete" type="button" class="history-batch__delete">删除</button>
+        </div>
+        <main id="history-list" class="history-list" aria-live="polite"></main>
+        <footer class="history-panel__footer">
+          <span id="history-storage">正在计算本地图片占用…</span>
+          <span>图片、OCR 与标签仅保存在此电脑；仅最旧的未收藏项会自动清理。</span>
+        </footer>
       </section>
     </main>
     <script type="module" src="/src/main.ts"></script>

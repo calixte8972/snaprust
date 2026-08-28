@@ -1,4 +1,3 @@
-import { PhysicalPosition, PhysicalSize } from "@tauri-apps/api/dpi";
 import { currentMonitor, getCurrentWindow } from "@tauri-apps/api/window";
 
 import {
@@ -7,9 +6,17 @@ import {
   getPinnedCaptureImage,
   revealPinWindow,
   setPinOpacity,
+  setPinWindowGeometry,
   warmupPinWindow,
 } from "./screenshot";
-import { clamp, minimumPinZoom, zoomedWindowGeometry } from "./pin-geometry";
+import {
+  clamp,
+  minimumPinZoom,
+  zoomedWindowGeometry,
+  type PinPoint,
+  type PinSize,
+  type PinWorkArea,
+} from "./pin-geometry";
 import { waitForCompositorWarmup } from "./window-readiness";
 import "./pin.css";
 
@@ -32,12 +39,13 @@ let dragStarted = false;
 let closing = false;
 let imageObjectUrl: string | null = null;
 let committedZoom = 1;
-let zoomCommitTimer: number | undefined;
 let zoomCommitInFlight = false;
 let zoomRevision = 0;
 let zoomAnchor = { x: 0.5, y: 0.5 };
+let nativePosition: PinPoint | null = null;
+let nativeSize: PinSize | null = null;
+let nativeWorkArea: PinWorkArea | null = null;
 const MIN_VISIBLE_EDGE = 64;
-const ZOOM_COMMIT_DELAY_MS = 90;
 
 function showHud(message?: string): void {
   window.clearTimeout(hudTimer);
@@ -56,38 +64,49 @@ function previewZoom(): void {
   image.style.transform = scale === 1 ? "" : `scale(${scale})`;
 }
 
+async function refreshNativeGeometry(): Promise<void> {
+  const [position, size, monitor] = await Promise.all([
+    pinWindow.outerPosition(),
+    pinWindow.innerSize(),
+    currentMonitor(),
+  ]);
+  nativePosition = position;
+  nativeSize = size;
+  nativeWorkArea = monitor?.workArea ?? null;
+}
+
 async function commitZoom(revision: number): Promise<void> {
   if (closing) return;
-  if (zoomCommitInFlight) {
-    scheduleZoomCommit();
-    return;
-  }
 
   zoomCommitInFlight = true;
   const targetZoom = zoom;
   const startZoom = committedZoom;
+  const targetAnchor = { ...zoomAnchor };
   try {
-    const [position, size, monitor] = await Promise.all([
-      pinWindow.outerPosition(),
-      pinWindow.innerSize(),
-      currentMonitor(),
-    ]);
+    if (!nativePosition || !nativeSize) await refreshNativeGeometry();
+    if (!nativePosition || !nativeSize) throw new Error("pin window geometry is unavailable");
     const ratio = targetZoom / startZoom;
     const geometry = zoomedWindowGeometry(
-      position,
-      size,
-      zoomAnchor,
+      nativePosition,
+      nativeSize,
+      targetAnchor,
       ratio,
-      monitor?.workArea ?? null,
+      nativeWorkArea,
       MIN_VISIBLE_EDGE,
     );
 
-    await pinWindow.setSize(new PhysicalSize(geometry.size.width, geometry.size.height));
-    committedZoom = targetZoom;
-    await pinWindow.setPosition(
-      new PhysicalPosition(geometry.position.x, geometry.position.y),
+    await setPinWindowGeometry(
+      pinWindow.label,
+      geometry.position.x,
+      geometry.position.y,
+      geometry.size.width,
+      geometry.size.height,
     );
+    committedZoom = targetZoom;
+    nativePosition = geometry.position;
+    nativeSize = geometry.size;
   } catch (error) {
+    if (revision === zoomRevision) zoom = committedZoom;
     console.error("failed to resize pin window", error);
     showHud(`缩放失败：${String(error)}`);
   } finally {
@@ -96,18 +115,31 @@ async function commitZoom(revision: number): Promise<void> {
       image.style.transform = "";
     } else {
       previewZoom();
-      scheduleZoomCommit();
+      void commitZoom(zoomRevision);
     }
   }
 }
 
-function scheduleZoomCommit(delay = ZOOM_COMMIT_DELAY_MS): void {
-  window.clearTimeout(zoomCommitTimer);
+function scheduleZoomCommit(): void {
   zoomRevision += 1;
-  const revision = zoomRevision;
-  zoomCommitTimer = window.setTimeout(() => {
-    void commitZoom(revision);
-  }, delay);
+  if (!closing && !zoomCommitInFlight) void commitZoom(zoomRevision);
+}
+
+async function resetView(): Promise<void> {
+  try {
+    await refreshNativeGeometry();
+    if (nativeSize) committedZoom = nativeSize.width / baseWidth;
+    zoom = 1;
+    opacity = 1;
+    zoomAnchor = { x: 0.5, y: 0.5 };
+    previewZoom();
+    scheduleZoomCommit();
+    scheduleOpacity(opacity);
+    showHud();
+  } catch (error) {
+    console.error("failed to reset pin view", error);
+    showHud(`重置失败：${String(error)}`);
+  }
 }
 
 function createLatestScheduler<Value>(apply: (value: Value) => Promise<void>) {
@@ -143,7 +175,6 @@ function createLatestScheduler<Value>(apply: (value: Value) => Promise<void>) {
 async function close(): Promise<void> {
   if (closing) return;
   closing = true;
-  window.clearTimeout(zoomCommitTimer);
   try {
     await closePin(pinWindow.label);
   } catch (error) {
@@ -169,15 +200,20 @@ document.addEventListener("pointermove", (event) => {
   if (!dragOrigin || dragStarted || (event.buttons & 1) === 0) return;
   if (Math.hypot(event.clientX - dragOrigin.x, event.clientY - dragOrigin.y) < 4) return;
   dragStarted = true;
-  void pinWindow.startDragging().catch((error) => {
-    console.error("failed to start dragging pin window", error);
-    showHud(`拖动失败：${String(error)}`);
-  });
+  void pinWindow.startDragging()
+    .then(refreshNativeGeometry)
+    .catch((error) => {
+      console.error("failed to start dragging pin window", error);
+      showHud(`拖动失败：${String(error)}`);
+    });
 });
 
 document.addEventListener("pointerup", () => {
   dragOrigin = null;
   dragStarted = false;
+  void refreshNativeGeometry().catch((error) => {
+    console.error("failed to refresh pin geometry after dragging", error);
+  });
 });
 
 document.addEventListener("dblclick", (event) => {
@@ -208,13 +244,7 @@ window.addEventListener("keydown", (event) => {
     void close();
   } else if (event.key === "0") {
     event.preventDefault();
-    zoom = 1;
-    opacity = 1;
-    zoomAnchor = { x: 0.5, y: 0.5 };
-    previewZoom();
-    scheduleZoomCommit(0);
-    scheduleOpacity(opacity);
-    showHud();
+    void resetView();
   } else if (event.key === "[" || event.key === "]") {
     event.preventDefault();
     opacity = Math.max(0.2, Math.min(1, opacity + (event.key === "]" ? 0.05 : -0.05)));
@@ -239,6 +269,7 @@ async function initialize(): Promise<void> {
   const decodeStarted = performance.now();
   await image.decode();
   const decodeMs = performance.now() - decodeStarted;
+  await refreshNativeGeometry();
   await warmupPinWindow(pinWindow.label);
   await waitForCompositorWarmup();
   await revealPinWindow(pinWindow.label);
@@ -250,7 +281,6 @@ async function initialize(): Promise<void> {
 }
 
 window.addEventListener("beforeunload", () => {
-  window.clearTimeout(zoomCommitTimer);
   if (imageObjectUrl) URL.revokeObjectURL(imageObjectUrl);
 });
 

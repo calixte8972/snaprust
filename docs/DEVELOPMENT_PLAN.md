@@ -1,6 +1,6 @@
 # SnapRust 开发计划
 
-> 当前状态：V0.4 已完成。Windows 上已打通 `Ctrl + Shift + A` → 虚拟桌面截图 → 框选 → 标注 → 复制图片 / 创建独立置顶钉图窗口。
+> 当前状态：V0.7B 截图翻译与多提供商适配已完成。Windows 上已打通 `Ctrl + Shift + A` → 虚拟桌面截图 → 框选 → 标注 / 本地 OCR / LLM 翻译 → 复制图片或文字 / 创建独立置顶钉图窗口 → `Alt + H` 本地历史管理、自动清理与导出。
 
 ## 1. 技术栈与范围
 
@@ -9,7 +9,7 @@
 - 后端：Rust、Tauri 2、`windows`（windows-rs）、`image`、`serde`
 - 前端：Vanilla TypeScript、HTML、CSS、Vite
 - 目标平台：Windows 10/11，MSVC 工具链，WebView2
-- 暂不引入：Tokio、前端框架、SQLite、OCR、云服务
+- 暂不引入：直接 Tokio 依赖、前端框架、SQLite、云服务和第三方 OCR 模型
 
 依赖遵循“用到时引入”的原则。Tauri 与全局快捷键属于第一个切片；`windows`、`image` 和 `serde` 在截图数据结构与 GDI 截屏切片中加入，避免只有名字、没有用途的依赖。
 
@@ -219,8 +219,8 @@ CF_DIB Windows 剪贴板
 
 ### V0.4 钉图
 
-- [x] 独立无边框置顶窗口；每张钉图使用唯一 Tauri 窗口标签
-- [x] Rust 保存最终合成后的 PNG，钉图前端不持有截图业务源数据
+- [x] Windows 独立原生无边框置顶 HWND；每张钉图使用唯一标签和独立消息线程
+- [x] Rust 直接持有最终合成后的 BGRA 像素；Windows 钉图不再编码 PNG 或创建 WebView
 - [x] 拖动移动、滚轮缩放、`Shift + 滚轮`/键盘透明度、双击/`Esc` 关闭
 - [x] 使用 `HWND`、`WS_EX_LAYERED` 与 `SetLayeredWindowAttributes` 调整原生窗口透明度
 - [x] 窗口销毁时清理 Rust `PinStore`，创建失败时回滚已插入图片
@@ -230,26 +230,105 @@ CF_DIB Windows 剪贴板
 ```text
 Annotation[] + Selected RgbaImage
               ↓ Rust 最终栅格化
-PinStore（label → PNG bytes / width / height）
-              ↓ WebviewWindowBuilder + binary IPC
-pin.html（仅显示与交互）
-              ├─ startDragging
-              ├─ setSize（滚轮缩放）
+PinStore（label → 生命周期与尺寸）
+              ↓ Rust 直接传递 RgbaImage
+原生 HWND + 独立 Windows 消息线程
+              ├─ WM_PAINT / StretchDIBits（同步高质量重绘）
+              ├─ WM_MOUSEWHEEL / SetWindowPos（鼠标锚点缩放）
               ├─ SetLayeredWindowAttributes（透明度）
-              └─ close_pin（删除状态并关闭）
+              ├─ WM_NCLBUTTONDOWN（拖动）
+              └─ WM_NCDESTROY（注销 HWND 并释放图片）
 ```
 
-动态 WebView 必须从异步 Tauri command 创建。同步 command 会阻塞 WebView 初始化，表现为只出现白色窗口壳且 IPC 不返回；本项目以 `async fn pin_selected_capture` 规避该 UI 调度死锁，不需要额外引入 Tokio 依赖。
+Windows 原生钉图不依赖 Tauri WebView 调度；旧的 `pin.html` 实现仅作为非 Windows 回退。每张原生钉图线程拥有自己的 HWND 与消息循环，截图主流程仍不直接依赖 Tokio。
 
 ### V0.5 OCR
 
-- OCR 作为截图后的独立能力，不阻塞核心截图链路
-- 出现后台任务后再评估 Tokio
+- [x] 使用 Windows `Windows.Media.Ocr` 与当前用户语言包完成纯本地识别
+- [x] Rust 从截图会话复制原始选区，排除前端标注对识别结果的干扰
+- [x] 超大选区按 `OcrEngine::MaxImageDimension` 保持比例缩小
+- [x] PNG 编码、WinRT 解码和 OCR 在 Tauri 后台阻塞任务中执行，不阻塞 UI
+- [x] 图片外侧结果面板显示语言、行数、尺寸与耗时，并通过 Rust 写入 `CF_UNICODETEXT`
+- [x] OCR 结果可直接编辑，修正后的文字可以一键复制
+- [x] 枚举 Windows 已安装的 OCR 语言，支持自动或指定语言重新识别
+- [x] 逐行坐标与文本区域高亮
+
+当前任务复用 Tauri 已内置的异步运行时即可，没有为了单次 OCR 引入直接 Tokio 依赖。OCR 仍是截图后的独立能力，失败不会破坏复制图片或钉图链路。
 
 ### V0.6 历史记录
 
-- SQLite 保存路径、尺寸、时间、OCR 文本、标签和收藏状态
-- 图片文件与元数据的生命周期必须保持一致
+- [x] SQLite 保存图片文件名、尺寸、时间、OCR 文本、标签和收藏状态
+- [x] 复制图片或钉图成功后自动保存 Rust 最终合成 PNG；取消和仅复制文字不落盘
+- [x] `Alt + H` 打开历史窗口，支持 OCR 文本搜索、收藏筛选、复制图片与重新钉图
+- [x] 删除操作要求前端明确确认，并删除同一记录对应的 PNG 与 SQLite 元数据
+- [x] 历史卡片内联标签编辑；标签参与 OCR/标签统一搜索，并兼容旧数据库自动迁移
+- [x] 自动保留最多 500 条且 PNG 总占用最多 2 GiB，优先删除最旧未收藏项；收藏永不自动删除
+- [x] 当前筛选结果多选、全选、批量收藏、批量取消收藏和批量确认删除
+- [x] 批量导出原始 PNG 与 UTF-8 BOM CSV 元数据到 Windows“下载/SnapRust Exports/时间戳”目录
+
+### V0.7 主动触发的即时翻译（进行中）
+
+产品定位不是系统输入法，而是“随时可调用的桌面翻译助手”。翻译必须由用户的明确快捷键、按钮或输入操作触发；不做后台读取剪贴板、不做输入监听、不在未经确认时把翻译文本写回其他应用。
+
+```text
+任意应用选中文字 ── Ctrl + Shift + T ──► 复制选区文字 ──► 翻译浮窗
+                                                            ├── 复制译文
+                                                            ├── 用户确认后替换原文
+                                                            └── 固定为普通钉图式翻译卡片
+
+截图框选 ── OCR ──► 点击“翻译” ──► 原文 / 译文并排显示 ──► 复制 / 保存历史
+```
+
+#### V0.7A：文本选择翻译
+
+- [ ] 注册默认全局快捷键 `Ctrl + Shift + T`；快捷键仅在用户主动触发时读取当前选择
+- [ ] Windows 路径通过一次受控 `Ctrl+C` 读取 `CF_UNICODETEXT`；选中内容无法复制的应用需展示明确失败提示，而不是猜测或注入文本
+- [ ] 创建小型、无任务栏、可关闭的翻译浮窗，显示原文、译文、源语言、目标语言、耗时与错误状态
+- [ ] 支持复制译文；“替换原文”必须由用户点击确认后才写剪贴板并发送粘贴动作
+- [ ] 对同一段原文、源/目标语言做进程内缓存，避免短时间重复请求
+- [ ] 所有文本传输由 Rust `translation` 模块执行；前端仅管理浮窗和状态
+
+#### V0.7B：OCR 翻译闭环
+
+- [x] OCR 面板增加“翻译”按钮，输入使用用户当前编辑后的 OCR 文本
+- [x] OCR 译文与原文并列显示；支持分别复制，且不影响原有“复制 OCR 文字”行为
+- [ ] 可选地将用户确认保存的译文写入历史元数据；默认不保存翻译内容
+- [ ] 历史搜索继续匹配 OCR/标签；是否将译文纳入搜索必须是用户可见的独立设置
+
+当前实现说明：V0.7B 使用 Provider Adapter 统一 Chat Completions 请求，内置 DeepSeek、OpenAI、OpenAI-compatible 网关和本机 Ollama 适配器；翻译请求只在用户点击“翻译”后由 Rust 发起。提供商、模型、端点和密钥通过环境变量或面板配置，不进入前端代码、截图历史或 SQLite。目标语言由 OCR 面板选择，提示词要求模型只返回译文。翻译失败只更新翻译面板状态，不影响复制图片、钉图和 OCR 原文复制。
+
+#### V0.7 的翻译服务边界
+
+- [x] 选定首个 LLM 翻译服务并实现 Provider Adapter / Chat Completions HTTP 边界，不把 HTTP/API 逻辑写进 TypeScript
+- [x] UI 直接配置 DeepSeek、OpenAI、OpenAI-compatible 网关或 Ollama 的 API Key、模型、端点并保存；提供保存后测试请求
+- [ ] UI 在首次启用在线翻译前明确提示“文本将发送至所选翻译服务”；提供总开关和清晰的失败/离线状态
+- [ ] API 密钥不得写入前端、截图历史或明文 SQLite；Windows 上优先使用系统凭据存储或 DPAPI 保护
+- [ ] 暂不捆绑离线翻译模型：避免将轻量 EXE 直接膨胀到数百 MiB/数 GiB；离线模型作为后续独立评估项
+
+验收：在记事本、浏览器网页、Word/Office 类编辑器、VS Code/JetBrains 编辑器各人工验证一次“选中 → 热键 → 翻译 → 复制”；明确记录管理员窗口、密码框、游戏和不可复制控件的受限行为。网络超时、无网络、翻译服务限流、剪贴板占用和快速连续热键必须都能恢复到空闲状态。
+
+### V0.8 设置、隐私与日常体验
+
+- [ ] 设置窗口：源/目标语言、翻译服务、隐私开关、截图/历史/翻译快捷键及冲突提示（当前已先完成翻译服务配置子集）
+- [ ] 翻译历史默认关闭；用户启用后才保存原文、译文、语言、时间，并复用现有 SQLite 保留策略
+- [ ] 历史页增加“仅图片 / OCR / 翻译”筛选和统一全文搜索，但不让翻译数据默认泄露到导出
+- [ ] 截图、OCR、翻译和历史操作提供一致的短状态提示、可读错误和键盘可访问性
+- [ ] 补充真实双显示器、100%/125%/150% DPI、常用粘贴目标和高频截图压力回归
+
+### V0.9 发布准备与稳定性
+
+- [ ] 生成 NSIS 或 MSI 安装包，提供安装、卸载、开始菜单与可选开机启动
+- [ ] 规划并接入 Windows 代码签名；在签名前明确发行者名称、证书采购方式和私钥保管流程
+- [ ] 增加崩溃日志导出与“复制诊断信息”，默认不上传任何截图、OCR 或翻译文本
+- [ ] 维护版本迁移、历史备份/恢复说明与发行说明；安装包在干净 Windows 用户账户中回归
+- [ ] 自动更新、云同步和账号系统保持不做，除非后续有明确的用户需求与隐私方案
+
+### 明确暂不做
+
+- [ ] 真正的 Windows IME / 输入法：需要 TSF、COM 输入服务 DLL、系统注册、代码签名及长期兼容性维护，应作为独立产品/仓库评估
+- [ ] 未经用户触发的剪贴板监听、输入记录或自动上传文本
+- [ ] 默认联网、默认保存翻译历史、默认云端同步
+- [ ] 大型本地翻译模型和 GPU 推理运行时
 
 ## 5. 主要风险与处理原则
 
@@ -262,6 +341,10 @@ pin.html（仅显示与交互）
 | Win32 资源泄漏 | 对 DC、bitmap、global memory 使用小型 RAII 封装 | 用压力测试和诊断工具验证 |
 | 全屏窗口无法退出 | Rust 命令、前端 Esc、窗口失焦路径均回到 Idle | 增加托盘菜单紧急退出 |
 | 前端持有完整业务状态 | Rust 管理截图会话与最终图片 | 后续 OCR/历史同样通过命令边界 |
+| 在线翻译泄露敏感文字 | V0.6 不涉及 | V0.7 首次启用明确告知、用户主动触发、服务可替换且可完全关闭 |
+| 读取当前选中文字不兼容 | V0.6 不涉及 | 仅通过受控复制读取，失败时提示用户先手动复制；不注入进程或绕过应用安全边界 |
+| 翻译网络延迟影响交互 | V0.6 不涉及 | 请求可取消、显示进行中/失败状态、短期缓存和超时；不阻塞截图/OCR 主链路 |
+| 系统输入法复杂度失控 | V0.6 不涉及 | 明确不纳入 V0.x；后续若立项，单独采用 TSF/COM 组件、签名和兼容性测试计划 |
 
 ## 6. 工程质量门槛
 
@@ -321,11 +404,30 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - [x] 混合 DPI：前端运行时校准并提交虚拟桌面绝对物理选区，Rust 直接按物理矩形裁剪
 - [x] 马赛克一致性：前端和 Rust 使用相同块边界、RGBA 平均值与整数舍入规则
 - [x] 长画笔优化：采样上限、距离过滤与前后端 Ramer–Douglas–Peucker 路径简化
-- [x] 钉图体验：鼠标锚点即时缩放预览、90ms 延迟原生提交、最小操作尺寸与工作区边界保护
+- [x] 钉图体验：鼠标锚点即时缩放预览、立即提交与在途最新值追赶、最小操作尺寸与工作区边界保护
 - [x] 文字体验：截图原位多行输入、确认/取消、键盘交互与 512 字符协议上限
 - [x] 性能基准：Rust 分段计时、前端端到端计时、HUD/底栏/控制台展示与后台 PNG 编码
 - [x] 截图显示时序：隐藏预加载并解码 PNG、透明首帧预热 WebView 合成器、就绪后再显示截图遮罩
 - [x] 钉图显示时序：隐藏且原生全透明创建、无阴影预热 WebView、图片就绪后一次性恢复阴影和不透明度
+- [x] 钉图缩小透明区域：动态 WebView 启用原生透明，CSS 缩小预览未覆盖区域不再露出黑色窗口背景
+- [x] V0.5：Windows 内置 OCR、超大选区等比缩放和原始选区识别
+- [x] V0.5：图片外侧结果面板、识别元数据、错误提示和关闭交互
+- [x] V0.5：通过 Rust `CF_UNICODETEXT` 一键复制识别文字
+- [x] V0.5：英文合成图 OCR 自动测试与中英文真实截图人工回归
+- [x] V0.5：OCR 结果编辑、修改后复制与空内容按钮状态
+- [x] V0.5：已安装语言枚举、语言下拉选择与切换后自动重新识别
+- [x] V0.5：OCR 后台线程级 COM apartment，连续枚举/识别不重复拆除 WinRT 环境
+- [x] V0.5：将 Windows OCR 单词矩形合并为逐行区域，缩小识别后映射回原始选区；结果行悬停/聚焦高亮并可点击定位
+- [x] V0.6：SQLite/PNG 本地历史、自动入库、OCR 搜索、收藏、历史复制/钉图与确认删除
+- [x] V0.6：标签编辑、标签搜索与 SQLite 数据库版本迁移
+- [x] V0.6：500 条未收藏优先自动清理，以及筛选范围内的批量收藏 / 删除
+- [x] V0.6：2 GiB PNG 磁盘占用自动清理、占用可视化与批量 PNG/CSV 导出
+- [ ] V0.7A：选中文字 `Ctrl + Shift + T` 翻译浮窗、复制译文与用户确认替换
+- [x] V0.7B：OCR 原文/译文并列显示与分别复制
+- [x] V0.7B：Provider Adapter、多模型配置和 DeepSeek/OpenAI/OpenAI-compatible/Ollama 翻译服务选择
+- [ ] V0.7B：用户确认后保存译文到历史元数据
+- [ ] V0.8：翻译服务与语言设置、隐私开关、双屏/DPI/常用编辑器回归
+- [ ] V0.9：安装包、签名准备、诊断导出和干净环境发布回归
 
 ### 2026-08-24 实施记录
 
@@ -367,7 +469,7 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - 马赛克预览升级：Canvas 逐块读取当前已提交画面的 RGBA 像素，按与 Rust 相同的整数平均规则回填，不再使用深色网格占位效果。
 - 画笔路径升级：前端松开鼠标时先简化再传输，Rust 保存前执行同算法防御性规范化；约 2,000 点的带转角测试路径压缩到不超过 5 点并保留首尾与转角。
 - 三项优先级最终验收：`npm run check`、16 模块生产构建、`cargo fmt --check`、Clippy 零警告与 `cargo test` 全部通过；Rust 为 14 通过、1 个交互式测试忽略，真实当前桌面抓取在沙箱外额外通过（约 0.13 秒）。前端纯函数样例验证跨屏映射 `2,001 → 4` 点路径简化，以及 2×2 RGBA 马赛克平均值与 Rust 测试一致。
-- 钉图缩放升级：滚轮阶段只做 CSS 即时预览，90ms 静默期后使用物理窗口尺寸提交；保持鼠标锚点，窗口小于工作区时完整夹取，超出工作区时至少保留 64px 可操作区域。纯函数验证中心锚点放大与右下角工作区夹取。
+- 钉图缩放升级：滚轮阶段先做 CSS 即时预览，再使用物理窗口尺寸提交；保持鼠标锚点，窗口小于工作区时完整夹取，超出工作区时至少保留 64px 可操作区域。纯函数验证中心锚点放大与右下角工作区夹取。
 - 文字标注升级：移除 `window.prompt`，新增跟随 Canvas 缩放/滚动定位的原位多行编辑器；`Ctrl+Enter`/确认提交，`Esc`/取消只退出文字编辑，复制或钉图前会同步已确认文字。
 - 性能基准升级：Rust 返回 GDI 抓屏、裁剪、标注渲染、剪贴板、钉图 PNG 和窗口创建耗时；前端记录元数据/PNG IPC、浏览器解码和端到端耗时。当前机器 GUI 样本为抓屏约 214ms、整屏 PNG/IPC 247ms、解码 12ms、裁剪 20ms、选区 PNG/IPC 45ms、选区解码 7.1ms。
 - 基准驱动优化：整屏和选区 PNG 编码改用 `tauri::async_runtime::spawn_blocking`，避免 CPU 密集编码占用窗口命令线程；使用 Tauri 已内置运行时，未增加直接 Tokio 依赖。GUI 自动验收确认性能 HUD 与选区底栏正常显示；继续操作时检测到用户实体输入，按安全规则停止自动鼠标/键盘验收。
@@ -376,3 +478,32 @@ cargo test --manifest-path src-tauri/Cargo.toml
 - 黑帧优化静态验收：`npm run check`、17 模块生产构建、`cargo fmt --check`、Clippy 零警告与 `cargo test` 全部通过；Rust 为 14 通过、1 个交互式桌面测试忽略。合成器预热带 100ms 超时兜底，避免极端限帧场景卡住截图会话。
 - 钉图闪烁优化：动态钉图窗口改为 `visible(false)`，创建后通过 windows-rs 将整个 HWND 设为 0% 原生透明度；前端并行读取元数据/PNG并完成图片解码后，先无焦点、无阴影地显示透明窗口供 WebView2 预热两帧，最终命令再启用阴影、设置焦点并将 HWND 切到 100%。初始化失败会关闭隐藏窗口并触发 `PinStore` 清理。
 - 钉图闪烁优化静态验收：`npm run check`、18 模块生产构建、`cargo fmt --check`、Clippy 零警告与 `cargo test` 全部通过；Rust 为 14 通过、1 个交互式桌面测试忽略。截图遮罩和钉图窗口共用带 100ms 兜底的合成器预热模块。
+- 钉图缩小黑底修复：动态 `WebviewWindowBuilder` 补充 `transparent(true)`，使 `pin.css` 中透明的 `html`、`body` 和 `.pin-root` 真正透传到 Windows 桌面；滚轮缩小 CSS 预览阶段即使原生窗口尚未提交新尺寸，图片周围也保持透明。
+- 钉图缩小黑底静态验收：核对 Tauri 2.11.5 源码确认该配置同时传递给窗口构建器和 WebView2 `with_transparent`；`npm run check`、18 模块生产构建、`cargo fmt --check`、Clippy 零警告和 `cargo test` 全部通过，Rust 为 14 通过、1 个交互式桌面测试忽略。
+- 钉图缩放延迟优化：移除固定 90ms 防抖；Windows 后端以单次 `SetWindowPos` 原子更新物理位置和外部尺寸，并根据当前 inner/outer 差值换算目标窗口边框尺寸，避免两次 Tauri 调用造成的等待与位置跳变。
+- Release 体积实测：当前 `bundle.active=false`；生产前端约 `50 KiB`，最新 `snaprust.exe` 为 `9,408,000` 字节（`8.97 MiB`），另有无需随普通发行版分发的 `5.93 MiB` PDB。
+- 缩放延迟最终验收：`npm run check`、18 模块生产构建、`cargo fmt --check`、Clippy 零警告和 `cargo test` 全部通过；Rust 为 15 通过、1 个交互式桌面测试忽略，并新增目标 inner 尺寸到 Win32 outer 尺寸的边框差值及溢出测试。
+- 钉图缩放热路径优化：移除 `requestAnimationFrame` 提交等待，空闲状态在滚轮事件内立即发起原生命令，在途期间只保留最新修订并在完成后立刻追赶；前端缓存位置、inner 尺寸和工作区，仅在初始化/拖动后刷新。Rust 改用直接 Win32 `GetClientRect`/`GetWindowRect` 计算边框差值，使每轮热路径从三次 Tauri 查询加一次更新缩减为单次 Command 内的原生读取和 `SetWindowPos`。
+- 钉图缩放热路径最终验收：`npm run check`、18 模块生产构建、`cargo fmt --check`、Clippy 零警告、`cargo test` 与 Release 增量构建全部通过；Rust 为 15 通过、1 个交互式桌面测试忽略，优化后 EXE 为 `8.97 MiB`。
+- 钉图缩放原生化：普通滚轮改由进程内 `WH_MOUSE_LL` 钩子处理。钩子仅在至少存在一个钉图且鼠标命中其根 HWND 时读取滚轮增量，依据当前物理窗口尺寸、初始宽高、鼠标屏幕坐标和目标显示器工作区直接执行一次 `SetWindowPos`；这条热路径不再经过 WebView 事件、JavaScript 缩放预览或 Tauri IPC。`Shift + 滚轮` 会跳过原生缩放并继续交给前端透明度逻辑，多张钉图通过 HWND 注册表独立匹配，销毁后同步注销；无钉图时通过原子计数直接跳过全部窗口查询。
+- 原生缩放最终验收：应用实际启动并成功注册钩子，全局快捷键可进入截图覆盖层且 `Esc` 正常取消；`npm run check`、18 模块生产构建、`cargo fmt --check`、Clippy 零警告、`cargo test` 和 Release 构建全部通过，Rust 为 16 通过、1 个交互式桌面抓屏测试忽略。Release EXE 仍为 `9,408,000` 字节（`8.97 MiB`）。当前桌面自动化将透明全屏覆盖层误报为 `14 × 14`，无法可靠代替人工拖框，因此连续滚轮的主观丝滑度仍保留为一次人工回归项。
+- Windows 原生钉图窗口：移除钉图运行时的 WebView2、JavaScript、Tauri Command 和全局低级鼠标钩子。每张钉图在独立线程创建 `WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED` 原生 HWND；窗口过程直接处理滚轮、拖动、双击、键盘复位/透明度与销毁。滚轮在一次 `SetWindowPos` 后同步 `InvalidateRect + UpdateWindow`，`WM_PAINT` 使用 `StretchDIBits` 的 `HALFTONE` 模式重绘图片与原生 HUD，消息返回时画面已经完成更新。
+- 原生钉图数据与生命周期：Windows 路径直接将最终 `RgbaImage` 转为 BGRA 内存，不再执行钉图 PNG 编码、二进制 IPC、Blob 解码或合成器预热。窗口 `WM_NCDESTROY` 同步注销 label→HWND 并删除 `PinStore` 条目；非 Windows 仍保留原 Tauri/WebView 回退。
+- 原生钉图最终验收：`npm run check`、18 模块生产构建、`cargo fmt --check`、Clippy 零警告、常规 Rust 测试 16 通过/2 个交互式测试忽略、Release 构建全部通过；新增的真实 HWND 测试已单独显式运行，确认窗口创建、一格 `WM_MOUSEWHEEL` 后宽高同步增加、关闭以及 HWND/图片状态清理。
+- 钉图 HUD 外置布局：Windows 原生钉图不再把缩放/透明度信息绘制进图片客户区，而是创建一个 `112 × 20`、无背景、点击穿透且不抢焦点的独立原生 HUD 浮窗。HUD 以小号白字贴在图片右上方外侧，带一像素暗色文字阴影；图片上方没有空间时自动切换到右下方外侧，并始终限制在当前显示器工作区。新增纯函数测试验证上方定位、贴顶时下方回退与右边对齐。
+- 外置 HUD 最终验收：Clippy 零警告、常规 Rust 测试 17 通过/2 个交互式测试忽略；真实 HWND 测试单独执行通过，确认主钉图与 HUD 窗口可共同创建、缩放和清理；Release 构建通过。最新 EXE 为 `9,396,224` 字节（约 `8.96 MiB`），PDB 约 `5.99 MiB`。
+- V0.5 OCR 实现：新增独立 `ocr` 模块，通过 `InMemoryRandomAccessStream`、`BitmapDecoder`、`SoftwareBitmap` 和 `OcrEngine` 识别 Rust 会话中的未标注选区；识别超大图片前按系统上限等比缩小。命令使用 Tauri 内置 `spawn_blocking`，没有新增直接 Tokio、OCR 模型或云服务依赖。
+- V0.5 OCR 界面：标注工具栏新增 `OCR`；结果显示在截图外侧的响应式面板中，包含系统识别语言、非空行数、源/处理尺寸和耗时。文字复制通过 Rust 写入 `CF_UNICODETEXT`，不会与 `Ctrl+C` 复制图片的原有行为混淆。
+- V0.5 OCR 验收：`npm run build`、常规 Rust 测试（20 通过、3 个交互式测试忽略）和 Release 构建通过；显式 Windows OCR 测试从合成图片成功识别 `SNAPRUST OCR 12345`。真实 125% DPI 桌面框选 `982 × 494` 中英文区域，`zh-Hans-CN` 在约 `156ms` 返回结果，复制按钮显示“已复制”，`Esc` 正常退出。新 EXE 为 `9,521,152` 字节（约 `9.08 MiB`）。
+- 钉图 HUD 配色调整：外置缩放/透明度提示改为黑色正文和一像素浅色阴影；透明窗口色键由黑色改为洋红色内部键值，避免黑色文字被 `LWA_COLORKEY` 一并透明。新增测试保证正文黑色与透明色键永远不同。
+- V0.5 下一步：OCR 文本框改为可编辑，识别错误可原位修正；复制按钮始终读取编辑后的当前文本，空内容自动禁用，聚焦时以细绿色边线提示编辑状态。
+- V0.5 语言切换：新增 `list_ocr_languages` 命令，使用 `OcrEngine::AvailableRecognizerLanguages` 返回标签、本地名称和显示名称；前端保留“自动（系统）”选项，只展示当前 Windows 已安装的语言。切换下拉框后立即用 `TryCreateFromLanguage` 重新识别，用户选择在后续截图会话中保留。
+- OCR 连续调用稳定性：实测“枚举语言后立即指定语言识别”暴露重复 `CoInitializeEx`/`CoUninitialize` 与 windows-rs WinRT 工厂缓存之间的访问冲突；改为每个 Tauri blocking worker 使用线程局部 COM apartment，在线程退出时才注销。连续枚举与显式识别测试随后通过。
+- OCR 语言验收：当前设备实际枚举到 `中文(中华人民共和国) · zh-Hans-CN`；使用该显式语言从合成图片成功识别 `SNAPRUST OCR 12345`。常规 Rust 测试为 21 通过、4 个系统/桌面测试忽略，语言标签控制字符输入会被拒绝；Clippy、TypeScript、生产前端和 Release 构建全部通过。最新 EXE 为 `9,597,952` 字节（约 `9.15 MiB`）。
+- OCR 文本定位：Windows 返回逐词 `BoundingRect`，Rust 合并为行并在 OCR 为满足系统尺寸上限而缩小图片时映射回源选区；前端结果行支持鼠标悬停、键盘聚焦高亮及点击滚动画布定位。新增坐标缩放/边界单元测试，真实 Windows OCR 合成图测试同时断言至少存在一个有效定位行。
+- V0.6 历史记录：新增 `rusqlite`（bundled SQLite）和 `history` Rust 模块。应用数据目录内以 SQLite 保存元数据、以独立 PNG 保存最终截图；`Alt + H` 复用隐藏 overlay 窗口打开历史，支持缩略图、OCR 文本搜索、仅收藏、复制、重新钉图与确认删除。单元测试覆盖保存、搜索、收藏、缩略图与图片/元数据删除闭环。
+- V0.6 静态验收：`npm run check`、18 模块生产前端构建、`cargo fmt --check`、Clippy 零警告和 `cargo test` 全部通过；Rust 为 27 通过、4 个依赖真实 Windows 服务/桌面的测试忽略。Bundled SQLite 使 Release EXE 变为 `11,611,136` 字节（约 `11.07 MiB`），无需附带 DLL。
+- V0.6 标签：`screenshots` 新增 `tags` 文本列；启动时用 `PRAGMA table_info` 检测旧库并只在缺列时执行迁移。标签最多 12 个、单项最多 48 字符、以逗号分隔输入且自动去重；历史统一搜索同时匹配 OCR 文本与标签。静态检查与保存/搜索/收藏/缩略图/删除单元测试再次通过。
+- V0.6 历史管理：每次新截图成功保存后检查总历史量，超过 500 条时按保存时间删除最旧的未收藏记录；任何收藏都不会被自动清理。前端提供缩略图多选和当前筛选结果全选，Rust 对批量 ID 做正数、去重和最多 200 条限制后执行收藏/取消收藏或删除；批量删除仍必须经过浏览器确认。测试覆盖保留收藏的自动清理、批量去重收藏和批量删除。
+- V0.6 历史清理与导出：保留策略升级为“最多 500 条且 PNG 合计最多 2 GiB”；每次保存后按时间删除最旧的未收藏记录，收藏记录永不自动删除。历史页显示实际 PNG 占用/上限和条目数。批量“导出”会将选中的 PNG 按当前选择顺序复制到 Windows“下载/SnapRust Exports/SnapRust-时间戳/”，并写入带 UTF-8 BOM 的 `metadata.csv`（ID、文件名、尺寸、时间、收藏、标签和 OCR 文字）；原历史不会修改。单元测试覆盖磁盘阈值清理、收藏保留、PNG 输出及 OCR/标签 CSV 转义。
+- 本轮最终验收：`npm run check`、18 模块 Vite 生产构建、`cargo fmt --check`、`cargo check`、Clippy 零警告、`cargo test` 和 Release 构建全部通过；Rust 单元测试为 28 通过、4 个真实 Windows 服务/桌面测试忽略。最新 `snaprust.exe` 为 `11,617,280` 字节（约 `11.08 MiB`）。

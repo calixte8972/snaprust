@@ -7,8 +7,13 @@ fn capture_shortcut() -> Shortcut {
     Shortcut::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::KeyA)
 }
 
+fn history_shortcut() -> Shortcut {
+    Shortcut::new(Some(Modifiers::ALT), Code::KeyH)
+}
+
 pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
     let capture_shortcut = capture_shortcut();
+    let history_shortcut = history_shortcut();
 
     tauri_plugin_global_shortcut::Builder::new()
         .with_handler(move |app, shortcut, event| {
@@ -17,6 +22,11 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
                 && let Err(error) = crate::screenshot::begin_capture(app)
             {
                 eprintln!("failed to enter capture mode: {error}");
+            } else if shortcut == &history_shortcut
+                && event.state() == ShortcutState::Pressed
+                && let Err(error) = crate::history::show_history_window(app)
+            {
+                eprintln!("failed to open history: {error}");
             }
         })
         .build()
@@ -24,5 +34,6 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 
 pub fn register<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn Error>> {
     app.global_shortcut().register(capture_shortcut())?;
+    app.global_shortcut().register(history_shortcut())?;
     Ok(())
 }

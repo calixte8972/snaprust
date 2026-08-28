@@ -35,11 +35,12 @@ body,
 
 .pin-hud {
   position: absolute;
-  bottom: 10px;
-  left: 50%;
-  max-width: calc(100% - 20px);
+  z-index: 2;
+  top: 12px;
+  right: 12px;
+  max-width: calc(100% - 24px);
   padding: 6px 10px;
-  transform: translate(-50%, 8px);
+  transform: translateY(-8px);
   overflow: hidden;
   border: 1px solid rgb(255 255 255 / 18%);
   border-radius: 7px;
@@ -57,6 +58,6 @@ body,
 }
 
 .pin-hud.is-visible {
-  transform: translate(-50%, 0);
+  transform: translateY(0);
   opacity: 1;
 }

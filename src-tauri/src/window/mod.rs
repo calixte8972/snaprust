@@ -1,4 +1,4 @@
-use tauri::{AppHandle, Emitter, Manager, PhysicalPosition, PhysicalSize, Runtime};
+use tauri::{AppHandle, Emitter, LogicalSize, Manager, PhysicalPosition, PhysicalSize, Runtime};
 
 use crate::screenshot::VirtualDesktop;
 
@@ -51,4 +51,40 @@ pub fn hide_capture_overlay<R: Runtime>(app: &AppHandle<R>) -> Result<(), String
         .ok_or_else(|| "capture overlay window is unavailable".to_owned())?;
 
     overlay.hide().map_err(|error| error.to_string())
+}
+
+pub fn prepare_history_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let overlay = app
+        .get_webview_window(OVERLAY_LABEL)
+        .ok_or_else(|| "history window is unavailable".to_owned())?;
+    overlay
+        .set_fullscreen(false)
+        .map_err(|error| error.to_string())?;
+    overlay
+        .set_size(LogicalSize::new(1_080_f64, 720_f64))
+        .map_err(|error| error.to_string())?;
+    overlay.center().map_err(|error| error.to_string())?;
+    overlay.show().map_err(|error| error.to_string())?;
+    overlay.set_focus().map_err(|error| error.to_string())?;
+    overlay
+        .emit("history://show", ())
+        .map_err(|error| error.to_string())
+}
+
+pub fn prepare_settings_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    let overlay = app
+        .get_webview_window(OVERLAY_LABEL)
+        .ok_or_else(|| "settings window is unavailable".to_owned())?;
+    overlay
+        .set_fullscreen(false)
+        .map_err(|error| error.to_string())?;
+    overlay
+        .set_size(LogicalSize::new(640_f64, 600_f64))
+        .map_err(|error| error.to_string())?;
+    overlay.center().map_err(|error| error.to_string())?;
+    overlay.show().map_err(|error| error.to_string())?;
+    overlay.set_focus().map_err(|error| error.to_string())?;
+    overlay
+        .emit("settings://show", ())
+        .map_err(|error| error.to_string())
 }

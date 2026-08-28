@@ -10,7 +10,7 @@ use std::{sync::Mutex, time::Instant};
 use image::{
     ImageEncoder, RgbaImage,
     codecs::png::{CompressionType, FilterType, PngEncoder},
-    imageops::crop_imm,
+    imageops::{crop_imm, rotate90, rotate180, rotate270},
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
@@ -22,6 +22,7 @@ pub struct CapturedScreen {
     image: Option<RgbaImage>,
     selection: Option<RgbaImage>,
     annotations: Vec<Annotation>,
+    rotation_quarters: u8,
     capture_ms: f64,
 }
 
@@ -48,12 +49,29 @@ pub struct PhysicalSelectionRect {
     height: u32,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionCropRect {
+    x: u32,
+    y: u32,
+    width: u32,
+    height: u32,
+}
+
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SelectionPayload {
     width: u32,
     height: u32,
     crop_ms: f64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RotationPayload {
+    quarters: u8,
+    width: u32,
+    height: u32,
 }
 
 #[derive(Serialize)]
@@ -161,7 +179,74 @@ impl CaptureSession {
         capture.selection = Some(selected);
         capture.image = None;
         capture.annotations.clear();
+        capture.rotation_quarters = 0;
         Ok(payload)
+    }
+
+    pub fn crop_selection(&self, crop: SelectionCropRect) -> Result<SelectionPayload, String> {
+        let started = Instant::now();
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| "capture session lock is poisoned".to_owned())?;
+        let capture = current
+            .as_mut()
+            .ok_or_else(|| "there is no active screen capture".to_owned())?;
+        let selection = capture
+            .selection
+            .as_ref()
+            .ok_or_else(|| "select an area before cropping".to_owned())?;
+        if crop.width == 0 || crop.height == 0 {
+            return Err("crop must have a non-zero width and height".to_owned());
+        }
+        let right = crop
+            .x
+            .checked_add(crop.width)
+            .ok_or_else(|| "crop right coordinate overflowed".to_owned())?;
+        let bottom = crop
+            .y
+            .checked_add(crop.height)
+            .ok_or_else(|| "crop bottom coordinate overflowed".to_owned())?;
+        if right > selection.width() || bottom > selection.height() {
+            return Err("crop is outside the selected image".to_owned());
+        }
+
+        let cropped = crop_imm(selection, crop.x, crop.y, crop.width, crop.height).to_image();
+        let payload = SelectionPayload {
+            width: cropped.width(),
+            height: cropped.height(),
+            crop_ms: elapsed_ms(started),
+        };
+        capture.selection = Some(cropped);
+        capture.annotations.clear();
+        capture.rotation_quarters = 0;
+        Ok(payload)
+    }
+
+    pub fn rotate_selection(&self, delta_quarters: i32) -> Result<RotationPayload, String> {
+        let mut current = self
+            .current
+            .lock()
+            .map_err(|_| "capture session lock is poisoned".to_owned())?;
+        let capture = current
+            .as_mut()
+            .ok_or_else(|| "there is no active screen capture".to_owned())?;
+        if capture.selection.is_none() {
+            return Err("select an area before rotating".to_owned());
+        }
+        capture.rotation_quarters =
+            (((i32::from(capture.rotation_quarters) + delta_quarters) % 4 + 4) % 4) as u8;
+        let selection = capture.selection.as_ref().expect("checked above");
+        let (width, height) = if capture.rotation_quarters % 2 == 0 {
+            (selection.width(), selection.height())
+        } else {
+            (selection.height(), selection.width())
+        };
+        Ok(RotationPayload {
+            quarters: capture.rotation_quarters,
+            width,
+            height,
+        })
     }
 
     pub fn selected_png(&self) -> Result<Vec<u8>, String> {
@@ -205,7 +290,7 @@ impl CaptureSession {
     }
 
     pub(crate) fn rendered_selection(&self) -> Result<RgbaImage, String> {
-        let (mut selection, annotations) = {
+        let (mut selection, annotations, rotation_quarters) = {
             let current = self
                 .current
                 .lock()
@@ -217,28 +302,39 @@ impl CaptureSession {
                 .selection
                 .as_ref()
                 .ok_or_else(|| "select an area before copying".to_owned())?;
-            (selection.clone(), capture.annotations.clone())
+            (
+                selection.clone(),
+                capture.annotations.clone(),
+                capture.rotation_quarters,
+            )
         };
 
         crate::annotation::render_annotations(&mut selection, &annotations)?;
+        selection = match rotation_quarters {
+            0 => selection,
+            1 => rotate90(&selection),
+            2 => rotate180(&selection),
+            3 => rotate270(&selection),
+            _ => unreachable!("rotation is normalized to four quarters"),
+        };
         Ok(selection)
     }
 
-    fn copy_selection(&self) -> Result<CopyPayload, String> {
-        let total_started = Instant::now();
-        let render_started = Instant::now();
-        let selection = self.rendered_selection()?;
-        let render_ms = elapsed_ms(render_started);
-        let clipboard_started = Instant::now();
-        crate::clipboard::write_image(&selection)?;
-        let clipboard_ms = elapsed_ms(clipboard_started);
-        Ok(CopyPayload {
-            width: selection.width(),
-            height: selection.height(),
-            render_ms,
-            clipboard_ms,
-            total_ms: elapsed_ms(total_started),
-        })
+    /// Returns the untouched selected pixels for OCR. Annotations are excluded
+    /// deliberately so arrows, mosaic blocks, and labels cannot pollute text
+    /// recognition.
+    pub(crate) fn raw_selection(&self) -> Result<RgbaImage, String> {
+        let current = self
+            .current
+            .lock()
+            .map_err(|_| "capture session lock is poisoned".to_owned())?;
+        let capture = current
+            .as_ref()
+            .ok_or_else(|| "there is no active screen capture".to_owned())?;
+        capture
+            .selection
+            .clone()
+            .ok_or_else(|| "select an area before recognizing text".to_owned())
     }
 }
 
@@ -310,8 +406,14 @@ impl PhysicalSelectionRect {
 
 pub fn begin_capture<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let session = app.state::<CaptureSession>();
-    if session.is_active()? || crate::window::is_capture_overlay_visible(app)? {
+    if session.is_active()? {
         return Ok(());
+    }
+    // History and settings reuse the capture WebView. Leave those modes before
+    // preparing a new capture, otherwise the global shortcut appears to do
+    // nothing while the overlay is still visible.
+    if crate::window::is_capture_overlay_visible(app)? {
+        crate::window::hide_capture_overlay(app)?;
     }
 
     let desktop = monitor::virtual_desktop()?;
@@ -323,6 +425,7 @@ pub fn begin_capture<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
         image: Some(image),
         selection: None,
         annotations: Vec::new(),
+        rotation_quarters: 0,
         capture_ms,
     })?;
 
@@ -339,9 +442,31 @@ pub fn cancel_capture<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     app.state::<CaptureSession>().clear()
 }
 
-pub fn copy_selected_capture<R: Runtime>(app: &AppHandle<R>) -> Result<CopyPayload, String> {
+pub fn copy_selected_capture<R: Runtime>(
+    app: &AppHandle<R>,
+    ocr_text: Option<&str>,
+) -> Result<CopyPayload, String> {
     let session = app.state::<CaptureSession>();
-    let result = session.copy_selection()?;
+    let total_started = Instant::now();
+    let render_started = Instant::now();
+    let image = session.rendered_selection()?;
+    let render_ms = elapsed_ms(render_started);
+    let clipboard_started = Instant::now();
+    crate::clipboard::write_image(&image)?;
+    let clipboard_ms = elapsed_ms(clipboard_started);
+    if let Err(error) = app
+        .state::<crate::history::HistoryStore>()
+        .save(&image, ocr_text)
+    {
+        eprintln!("failed to save copied screenshot in history: {error}");
+    }
+    let result = CopyPayload {
+        width: image.width(),
+        height: image.height(),
+        render_ms,
+        clipboard_ms,
+        total_ms: elapsed_ms(total_started),
+    };
     crate::window::hide_capture_overlay(app)?;
     session.clear()?;
     Ok(result)
@@ -349,13 +474,20 @@ pub fn copy_selected_capture<R: Runtime>(app: &AppHandle<R>) -> Result<CopyPaylo
 
 pub fn pin_selected_capture<R: Runtime>(
     app: &AppHandle<R>,
+    ocr_text: Option<&str>,
 ) -> Result<crate::pin::PinCreatedPayload, String> {
     let total_started = Instant::now();
     let session = app.state::<CaptureSession>();
     let render_started = Instant::now();
     let image = session.rendered_selection()?;
     let render_ms = elapsed_ms(render_started);
-    let mut result = crate::pin::create_pin(app, image)?;
+    let mut result = crate::pin::create_pin(app, image.clone())?;
+    if let Err(error) = app
+        .state::<crate::history::HistoryStore>()
+        .save(&image, ocr_text)
+    {
+        eprintln!("failed to save pinned screenshot in history: {error}");
+    }
     result.set_pipeline_performance(render_ms, elapsed_ms(total_started));
     crate::window::hide_capture_overlay(app)?;
     session.clear()?;
@@ -367,7 +499,8 @@ mod tests {
     use image::{GenericImageView, Rgba, RgbaImage, imageops::crop_imm};
 
     use super::{
-        CaptureSession, CapturedScreen, PhysicalSelectionRect, VirtualDesktop, monitor::MonitorInfo,
+        CaptureSession, CapturedScreen, PhysicalSelectionRect, SelectionCropRect, VirtualDesktop,
+        monitor::MonitorInfo,
     };
 
     fn desktop(x: i32, y: i32, width: u32, height: u32) -> VirtualDesktop {
@@ -396,6 +529,7 @@ mod tests {
                 image: Some(RgbaImage::from_pixel(8, 6, Rgba([10, 20, 30, 255]))),
                 selection: None,
                 annotations: Vec::new(),
+                rotation_quarters: 0,
                 capture_ms: 0.0,
             })
             .unwrap();
@@ -538,6 +672,70 @@ mod tests {
         let crop = crop_imm(&image, rect.x, rect.y, rect.width, rect.height).to_image();
 
         assert_eq!(crop.dimensions(), (1_250, 625));
+    }
+
+    #[test]
+    fn crops_selected_pixels_and_resets_rotation() {
+        let image = RgbaImage::from_fn(4, 3, |x, y| Rgba([x as u8, y as u8, 0, 255]));
+        let session = CaptureSession::default();
+        session
+            .replace(CapturedScreen {
+                desktop: desktop(0, 0, 4, 3),
+                image: None,
+                selection: Some(image),
+                annotations: Vec::new(),
+                rotation_quarters: 0,
+                capture_ms: 0.0,
+            })
+            .unwrap();
+
+        session.rotate_selection(1).unwrap();
+        let payload = session
+            .crop_selection(SelectionCropRect {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 1,
+            })
+            .unwrap();
+
+        assert_eq!((payload.width, payload.height), (2, 1));
+        let cropped = image::load_from_memory(&session.selected_png().unwrap()).unwrap();
+        assert_eq!(cropped.dimensions(), (2, 1));
+        assert_eq!(cropped.get_pixel(0, 0).0, [1, 1, 0, 255]);
+        assert_eq!(cropped.get_pixel(1, 0).0, [2, 1, 0, 255]);
+        assert_eq!(session.rendered_selection().unwrap().dimensions(), (2, 1));
+    }
+
+    #[test]
+    fn rotates_rendered_selection_before_output() {
+        let session = CaptureSession::default();
+        session
+            .replace(CapturedScreen {
+                desktop: desktop(0, 0, 2, 1),
+                image: None,
+                selection: Some(
+                    RgbaImage::from_raw(
+                        2,
+                        1,
+                        vec![
+                            255, 0, 0, 255, // red, left
+                            0, 0, 255, 255, // blue, right
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                annotations: Vec::new(),
+                rotation_quarters: 0,
+                capture_ms: 0.0,
+            })
+            .unwrap();
+
+        session.rotate_selection(1).unwrap();
+        let rendered = session.rendered_selection().unwrap();
+        assert_eq!(rendered.dimensions(), (1, 2));
+        assert_eq!(rendered.get_pixel(0, 0).0, [255, 0, 0, 255]);
+        assert_eq!(rendered.get_pixel(0, 1).0, [0, 0, 255, 255]);
     }
 
     #[test]

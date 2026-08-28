@@ -13,6 +13,7 @@ use windows::Win32::{
 };
 
 const CF_DIB_FORMAT: u32 = 8;
+const CF_UNICODE_TEXT_FORMAT: u32 = 13;
 const CLIPBOARD_RETRY_DELAY: Duration = Duration::from_millis(15);
 const CLIPBOARD_ATTEMPTS: usize = 6;
 
@@ -157,6 +158,46 @@ pub fn write_image(image: &RgbaImage) -> Result<(), String> {
     }
     global_memory.relinquish_to_clipboard();
 
+    Ok(())
+}
+
+pub fn write_text(text: &str) -> Result<(), String> {
+    if text.contains('\0') {
+        return Err("clipboard text cannot contain a null character".to_owned());
+    }
+
+    let utf16: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+    let byte_len = utf16
+        .len()
+        .checked_mul(size_of::<u16>())
+        .ok_or_else(|| "clipboard text size overflowed".to_owned())?;
+    let mut global_memory = GlobalMemory::allocate(byte_len)?;
+    let destination = unsafe { GlobalLock(global_memory.handle()) };
+    if destination.is_null() {
+        return Err("failed to lock clipboard text memory".to_owned());
+    }
+
+    // SAFETY: The allocation is exactly byte_len bytes, and utf16 includes the
+    // trailing null required by CF_UNICODETEXT.
+    unsafe {
+        copy_nonoverlapping(
+            utf16.as_ptr().cast::<u8>(),
+            destination.cast::<u8>(),
+            byte_len,
+        );
+        let _ = GlobalUnlock(global_memory.handle());
+    }
+
+    let _clipboard = ClipboardGuard::open()?;
+    unsafe {
+        EmptyClipboard().map_err(|error| format!("failed to empty clipboard: {error}"))?;
+        SetClipboardData(
+            CF_UNICODE_TEXT_FORMAT,
+            Some(global_memory.clipboard_handle()),
+        )
+        .map_err(|error| format!("failed to set text on clipboard: {error}"))?;
+    }
+    global_memory.relinquish_to_clipboard();
     Ok(())
 }
 

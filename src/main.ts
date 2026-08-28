@@ -2,18 +2,46 @@ import { listen } from "@tauri-apps/api/event";
 
 import {
   cancelCapture,
+  cancelTranslation,
+  copyHistoryCapture,
+  copyText,
   copySelectedCapture,
+  cropSelectedCapture,
+  deleteHistoryCapture,
+  deleteHistoryCaptures,
+  exportHistoryCaptures,
   getCurrentCapture,
   getCurrentCaptureImage,
+  getHistoryThumbnail,
+  getHistoryUsage,
   getSelectedCaptureImage,
+  getTranslationConfig,
+  hideHistoryWindow,
+  listHistory,
+  listOcrLanguages,
+  listTranslationModels,
+  listTranslationProviders,
+  pinHistoryCapture,
   pinSelectedCapture,
+  recognizeSelectedCapture,
   revealCaptureOverlay,
   selectCaptureRegion,
+  rotateSelectedCapture,
+  saveTranslationConfig,
   setCaptureAnnotations,
+  setHistoryFavorite,
+  setHistoryFavoriteBatch,
+  setHistoryTags,
+  translateText,
   type Annotation,
   type AnnotationPoint,
+  type AnnotationRect,
   type CapturePayload,
+  type HistoryItemPayload,
+  type OcrLinePayload,
+  type SelectionCropRect,
   type SelectionPayload,
+  type TranslationProviderPayload,
 } from "./screenshot";
 import {
   normalizeSelection,
@@ -38,13 +66,36 @@ function requireElement<Element extends HTMLElement>(selector: string): Element 
 
 const overlay = requireElement("#capture-overlay");
 const captureImage = requireElement<HTMLImageElement>("#capture-image");
-const captureStatus = requireElement("#capture-status");
+const settingsPanel = requireElement("#settings-panel");
+const settingsClose = requireElement<HTMLButtonElement>("#settings-close");
+const translationSettingsForm = requireElement<HTMLFormElement>("#translation-settings-form");
+const settingsProvider = requireElement<HTMLSelectElement>("#settings-provider");
+const settingsApiKey = requireElement<HTMLInputElement>("#settings-api-key");
+const settingsApiKeyLabel = requireElement("#settings-api-key-label");
+const settingsApiKeyHint = requireElement("#settings-api-key-hint");
+const settingsModel = requireElement<HTMLInputElement>("#settings-model");
+const settingsEndpoint = requireElement<HTMLInputElement>("#settings-endpoint");
+const settingsClearKey = requireElement<HTMLInputElement>("#settings-clear-key");
+const settingsStatus = requireElement("#settings-status");
+const settingsTest = requireElement<HTMLButtonElement>("#settings-test");
+const settingsSave = requireElement<HTMLButtonElement>("#settings-save");
 const selectionBox = requireElement("#selection-box");
 const selectionSize = requireElement("#selection-size");
-const monitorGuides = requireElement("#monitor-guides");
-const captureDesktop = requireElement("#capture-desktop");
-const capturePointer = requireElement("#capture-pointer");
 const annotationEditor = requireElement("#annotation-editor");
+const historyPanel = requireElement("#history-panel");
+const historyList = requireElement("#history-list");
+const historySummary = requireElement("#history-summary");
+const historyStorage = requireElement("#history-storage");
+const historySearch = requireElement<HTMLInputElement>("#history-search");
+const historyFavorites = requireElement<HTMLInputElement>("#history-favorites");
+const historyClose = requireElement<HTMLButtonElement>("#history-close");
+const historyBatch = requireElement("#history-batch");
+const historySelectAll = requireElement<HTMLInputElement>("#history-select-all");
+const historySelectedCount = requireElement("#history-selected-count");
+const historyBatchFavorite = requireElement<HTMLButtonElement>("#history-batch-favorite");
+const historyBatchUnfavorite = requireElement<HTMLButtonElement>("#history-batch-unfavorite");
+const historyBatchExport = requireElement<HTMLButtonElement>("#history-batch-export");
+const historyBatchDelete = requireElement<HTMLButtonElement>("#history-batch-delete");
 const annotationCanvasWrap = requireElement("#annotation-canvas-wrap");
 const annotationCanvas = requireElement<HTMLCanvasElement>("#annotation-canvas");
 const annotationTextEditor = requireElement("#annotation-text-editor");
@@ -55,10 +106,34 @@ const annotationStatus = requireElement("#annotation-status");
 const annotationColor = requireElement<HTMLInputElement>("#annotation-color");
 const annotationWidth = requireElement<HTMLInputElement>("#annotation-width");
 const annotationWidthValue = requireElement("#annotation-width-value");
+const annotationZoom = requireElement<HTMLInputElement>("#annotation-zoom");
+const annotationZoomValue = requireElement("#annotation-zoom-value");
+const annotationZoomOut = requireElement<HTMLButtonElement>("#annotation-zoom-out");
+const annotationZoomIn = requireElement<HTMLButtonElement>("#annotation-zoom-in");
+const annotationZoomFit = requireElement<HTMLButtonElement>("#annotation-zoom-fit");
+const annotationCropActions = requireElement("#annotation-crop-actions");
+const annotationCropCancel = requireElement<HTMLButtonElement>("#annotation-crop-cancel");
+const annotationCropApply = requireElement<HTMLButtonElement>("#annotation-crop-apply");
 const annotationUndo = requireElement<HTMLButtonElement>("#annotation-undo");
 const annotationRedo = requireElement<HTMLButtonElement>("#annotation-redo");
 const annotationClear = requireElement<HTMLButtonElement>("#annotation-clear");
+const annotationOcr = requireElement<HTMLButtonElement>("#annotation-ocr");
+const annotationTranslate = requireElement<HTMLButtonElement>("#annotation-translate");
 const annotationPin = requireElement<HTMLButtonElement>("#annotation-pin");
+const ocrPanel = requireElement("#ocr-panel");
+const ocrMeta = requireElement("#ocr-meta");
+const ocrLanguage = requireElement<HTMLSelectElement>("#ocr-language");
+const ocrResult = requireElement<HTMLTextAreaElement>("#ocr-result");
+const ocrLines = requireElement<HTMLDivElement>("#ocr-lines");
+const ocrCopy = requireElement<HTMLButtonElement>("#ocr-copy");
+const ocrClose = requireElement<HTMLButtonElement>("#ocr-close");
+const translationTarget = requireElement<HTMLSelectElement>("#translation-target");
+const translationModel = requireElement<HTMLSelectElement>("#translation-model");
+const translationRun = requireElement<HTMLButtonElement>("#translation-run");
+const translationResult = requireElement<HTMLTextAreaElement>("#translation-result");
+const translationMeta = requireElement("#translation-meta");
+const translationCopy = requireElement<HTMLButtonElement>("#translation-copy");
+const imageContextMenu = requireElement<HTMLElement>("#image-context-menu");
 const annotationContextOrNull = annotationCanvas.getContext("2d", { willReadFrequently: true });
 if (!annotationContextOrNull) {
   throw new Error("2D canvas context is unavailable");
@@ -80,16 +155,34 @@ let selectedCapture: SelectionPayload | null = null;
 let captureReady = false;
 let copyInProgress = false;
 let pinInProgress = false;
+let ocrInProgress = false;
+let translationInProgress = false;
+let cropInProgress = false;
+let nextTranslationRequestId = 0;
+let activeTranslationRequestId: number | null = null;
+let ocrLanguagesLoaded = false;
+let ocrLanguagesLoading = false;
+let translationModelsLoaded = false;
+let translationModelsLoading = false;
+let translationProviders: ReadonlyArray<TranslationProviderPayload> = [];
+let translationProvidersLoading = false;
+let settingsInProgress = false;
+let settingsRequestVersion = 0;
+let rotationQuarters = 0;
 let currentCapture: CapturePayload | null = null;
-type AnnotationTool = "arrow" | "rectangle" | "ellipse" | "brush" | "mosaic" | "text";
+type AnnotationTool = "arrow" | "rectangle" | "ellipse" | "brush" | "mosaic" | "text" | "crop";
 let annotationTool: AnnotationTool = "arrow";
 let selectedImage: HTMLImageElement | null = null;
 let annotations: Annotation[] = [];
 let annotationRedoStack: Annotation[][] = [];
 let annotationStart: AnnotationPoint | null = null;
 let annotationDraft: Annotation | null = null;
+let cropStart: AnnotationPoint | null = null;
+let cropDraft: AnnotationRect | null = null;
 let annotationPointerId: number | null = null;
 let annotationRenderFrame: number | null = null;
+let annotationZoomFactor = 1;
+let annotationZoomBaseScale = 1;
 let captureImageObjectUrl: string | null = null;
 let selectedImageObjectUrl: string | null = null;
 let captureSessionVersion = 0;
@@ -99,10 +192,28 @@ let pendingTextAnnotation: Readonly<{
   color: string;
   fontSize: number;
 }> | null = null;
-let annotationPerformanceSummary = "";
+let highlightedOcrLine: OcrLinePayload | null = null;
+let historyLoadVersion = 0;
+let historySearchTimer: number | null = null;
+const historyThumbnailUrls = new Map<number, string>();
+let historyThumbnailObserver: IntersectionObserver | null = null;
+let historyVisibleIds: number[] = [];
+const selectedHistoryIds = new Set<number>();
 
 function formatMilliseconds(value: number): string {
   return `${value.toFixed(value < 10 ? 1 : 0)}ms`;
+}
+
+function formatBytes(value: number): string {
+  if (value < 1024) return `${value} B`;
+  const units = ["KiB", "MiB", "GiB", "TiB"];
+  let formatted = value / 1024;
+  let unitIndex = 0;
+  while (formatted >= 1024 && unitIndex < units.length - 1) {
+    formatted /= 1024;
+    unitIndex += 1;
+  }
+  return `${formatted.toFixed(formatted < 10 ? 1 : 0)} ${units[unitIndex]}`;
 }
 
 function reportPerformance(stage: string, metrics: Readonly<Record<string, number>>): void {
@@ -142,31 +253,435 @@ function releaseImageResources(): void {
   committedAnnotationCanvas.height = 1;
 }
 
+function releaseHistoryThumbnails(): void {
+  historyThumbnailObserver?.disconnect();
+  historyThumbnailObserver = null;
+  historyThumbnailUrls.forEach((url) => URL.revokeObjectURL(url));
+  historyThumbnailUrls.clear();
+}
+
+function observeHistoryThumbnail(image: HTMLImageElement, id: number): void {
+  image.dataset.historyId = String(id);
+  if (typeof IntersectionObserver === "undefined") {
+    void loadHistoryThumbnail(id, image, historyLoadVersion);
+    return;
+  }
+
+  historyThumbnailObserver ??= new IntersectionObserver(
+    (entries) => {
+      for (const entry of entries) {
+        if (!entry.isIntersecting) continue;
+        const target = entry.target as HTMLImageElement;
+        const targetId = Number(target.dataset.historyId);
+        historyThumbnailObserver?.unobserve(target);
+        if (Number.isInteger(targetId)) {
+          void loadHistoryThumbnail(targetId, target, historyLoadVersion);
+        }
+      }
+    },
+    { root: historyList, rootMargin: "280px 0px" },
+  );
+  historyThumbnailObserver.observe(image);
+}
+
+function cancelActiveTranslationRequest(): void {
+  const requestId = activeTranslationRequestId;
+  activeTranslationRequestId = null;
+  if (requestId !== null) {
+    void cancelTranslation(requestId).catch((error) => {
+      console.debug("failed to cancel translation request", error);
+    });
+  }
+}
+
 function resetSelectionUi(): void {
   captureSessionVersion += 1;
+  settingsRequestVersion += 1;
+  cancelActiveTranslationRequest();
+  settingsInProgress = false;
+  settingsSave.disabled = false;
+  settingsTest.disabled = false;
+  settingsPanel.hidden = true;
   releaseImageResources();
+  releaseHistoryThumbnails();
   dragStart = null;
   activePointerId = null;
+  rotationQuarters = 0;
+  annotationCanvas.style.transform = "";
   currentSelection = null;
   selectedCapture = null;
   copyInProgress = false;
   pinInProgress = false;
+  ocrInProgress = false;
+  translationInProgress = false;
+  cropInProgress = false;
+  annotationCanvas.style.width = "";
+  annotationCanvas.style.height = "";
+  annotationCanvas.style.maxWidth = "";
+  annotationCanvas.style.maxHeight = "";
+  annotationZoomFactor = 1;
+  annotationZoomBaseScale = 1;
+  annotationZoom.value = "100";
+  annotationZoomValue.textContent = "100%";
   overlay.dataset.hasSelection = "false";
   selectionBox.style.cssText = "";
   selectionSize.textContent = "";
   annotationEditor.hidden = true;
+  annotationEditor.style.removeProperty("--annotation-editor-width");
+  annotationEditor.style.removeProperty("--annotation-editor-height");
+  historyPanel.hidden = true;
   overlay.dataset.state = "idle";
   annotations = [];
   annotationRedoStack = [];
   annotationStart = null;
   annotationDraft = null;
+  cropStart = null;
+  cropDraft = null;
+  annotationEditor.dataset.mode = "";
+  annotationCropActions.hidden = true;
+  annotationCropApply.disabled = true;
   annotationPointerId = null;
   annotationUndo.disabled = true;
   annotationRedo.disabled = true;
   annotationClear.disabled = true;
   annotationPin.disabled = false;
-  annotationPerformanceSummary = "";
+  annotationOcr.disabled = false;
+  ocrPanel.hidden = true;
+  ocrMeta.textContent = "等待识别";
+  ocrResult.value = "";
+  renderOcrLines([]);
+  ocrCopy.disabled = true;
+  ocrCopy.textContent = "复制文字";
+  translationResult.value = "";
+  translationMeta.textContent = "需要配置翻译服务";
+  translationCopy.disabled = true;
+  translationCopy.textContent = "复制译文";
+  translationRun.disabled = false;
+  annotationTranslate.disabled = false;
+  ocrLanguage.disabled = !ocrLanguagesLoaded || ocrLanguage.options.length <= 1;
   cancelTextEditor();
+}
+
+function formatHistoryDate(createdAtMs: number): string {
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(new Date(createdAtMs));
+}
+
+function historyOcrPreview(item: HistoryItemPayload): string {
+  const text = item.ocrText?.replace(/\s+/g, " ").trim();
+  return text || "未保存 OCR 文字";
+}
+
+function parseHistoryTags(value: string): string[] {
+  return value
+    .split(/[,，]/)
+    .map((tag) => tag.trim())
+    .filter((tag) => tag.length > 0);
+}
+
+function makeHistoryAction(label: string, title: string): HTMLButtonElement {
+  const button = document.createElement("button");
+  button.type = "button";
+  button.className = "history-card__action";
+  button.textContent = label;
+  button.title = title;
+  return button;
+}
+
+function updateHistoryBatchControls(): void {
+  const selectedCount = selectedHistoryIds.size;
+  const visibleCount = historyVisibleIds.length;
+  historyBatch.hidden = visibleCount === 0;
+  historySelectedCount.textContent = `已选择 ${selectedCount} 项`;
+  historySelectAll.checked = visibleCount > 0 && selectedCount === visibleCount;
+  historySelectAll.indeterminate = selectedCount > 0 && selectedCount < visibleCount;
+  historyBatchFavorite.disabled = selectedCount === 0;
+  historyBatchUnfavorite.disabled = selectedCount === 0;
+  historyBatchExport.disabled = selectedCount === 0;
+  historyBatchDelete.disabled = selectedCount === 0;
+}
+
+function currentSelectedHistoryIds(): number[] {
+  return historyVisibleIds.filter((id) => selectedHistoryIds.has(id));
+}
+
+function renderHistory(items: ReadonlyArray<HistoryItemPayload>): void {
+  releaseHistoryThumbnails();
+  historyList.replaceChildren();
+  historyVisibleIds = items.map((item) => item.id);
+  selectedHistoryIds.clear();
+  updateHistoryBatchControls();
+  historySummary.textContent = items.length === 0
+    ? "没有符合条件的截图"
+    : `显示最近 ${items.length} 条本地截图`;
+  if (items.length === 0) {
+    const empty = document.createElement("p");
+    empty.className = "history-empty";
+    empty.textContent = "完成一次复制图片或钉图后，成品截图会自动出现在这里。";
+    historyList.append(empty);
+    return;
+  }
+
+  items.forEach((item) => {
+    const card = document.createElement("article");
+    card.className = "history-card";
+    const thumbnail = document.createElement("img");
+    thumbnail.className = "history-card__thumbnail";
+    thumbnail.loading = "lazy";
+    thumbnail.decoding = "async";
+    thumbnail.alt = `${formatHistoryDate(item.createdAtMs)} 的截图缩略图`;
+    const thumbnailWrap = document.createElement("div");
+    thumbnailWrap.className = "history-card__thumbnail-wrap";
+    const selectLabel = document.createElement("label");
+    selectLabel.className = "history-card__select";
+    const select = document.createElement("input");
+    select.type = "checkbox";
+    select.dataset.historyId = String(item.id);
+    select.checked = selectedHistoryIds.has(item.id);
+    select.setAttribute("aria-label", `选择 ${formatHistoryDate(item.createdAtMs)} 的截图`);
+    select.addEventListener("change", () => {
+      if (select.checked) selectedHistoryIds.add(item.id);
+      else selectedHistoryIds.delete(item.id);
+      updateHistoryBatchControls();
+    });
+    selectLabel.append(select);
+    thumbnailWrap.append(thumbnail);
+    thumbnailWrap.append(selectLabel);
+    const content = document.createElement("div");
+    content.className = "history-card__content";
+    const meta = document.createElement("span");
+    meta.className = "history-card__meta";
+    meta.textContent = `${formatHistoryDate(item.createdAtMs)} · ${item.width} × ${item.height}`;
+    const preview = document.createElement("p");
+    preview.className = "history-card__preview";
+    preview.textContent = historyOcrPreview(item);
+    const tags = document.createElement("div");
+    tags.className = "history-card__tags";
+    item.tags.forEach((tag) => {
+      const chip = document.createElement("span");
+      chip.className = "history-tag";
+      chip.textContent = tag;
+      tags.append(chip);
+    });
+    const tagEditor = document.createElement("form");
+    tagEditor.className = "history-card__tag-editor";
+    tagEditor.hidden = true;
+    const tagInput = document.createElement("input");
+    tagInput.type = "text";
+    tagInput.maxLength = 512;
+    tagInput.value = item.tags.join(", ");
+    tagInput.placeholder = "标签，以逗号分隔";
+    tagInput.setAttribute("aria-label", "历史标签，以逗号分隔");
+    const tagSave = makeHistoryAction("保存", "保存标签");
+    tagSave.type = "submit";
+    tagEditor.append(tagInput, tagSave);
+    const actions = document.createElement("div");
+    actions.className = "history-card__actions";
+    const copy = makeHistoryAction("复制", "复制图片到剪贴板");
+    const pin = makeHistoryAction("📌", "重新钉图");
+    const favorite = makeHistoryAction(item.favorite ? "★" : "☆", item.favorite ? "取消收藏" : "收藏");
+    favorite.classList.toggle("is-favorite", item.favorite);
+    const editTags = makeHistoryAction("标签", "编辑标签");
+    const remove = makeHistoryAction("删除", "永久删除这条历史记录和图片");
+    remove.classList.add("history-card__action--danger");
+    copy.addEventListener("click", () => void copyHistory(item.id, copy));
+    pin.addEventListener("click", () => void pinHistory(item.id, pin));
+    favorite.addEventListener("click", () => void toggleHistoryFavorite(item, favorite));
+    editTags.addEventListener("click", () => {
+      tagEditor.hidden = false;
+      tagInput.focus();
+      tagInput.select();
+    });
+    tagEditor.addEventListener("submit", (event) => {
+      event.preventDefault();
+      void saveHistoryTags(item.id, parseHistoryTags(tagInput.value), tagSave);
+    });
+    remove.addEventListener("click", () => void removeHistory(item));
+    actions.append(copy, pin, favorite, editTags, remove);
+    content.append(meta, preview, tags, tagEditor, actions);
+    card.append(thumbnailWrap, content);
+    historyList.append(card);
+    observeHistoryThumbnail(thumbnail, item.id);
+  });
+}
+
+async function loadHistoryThumbnail(id: number, image: HTMLImageElement, version: number): Promise<void> {
+  try {
+    const png = await getHistoryThumbnail(id);
+    if (version !== historyLoadVersion || historyPanel.hidden || !historyList.contains(image)) return;
+    const objectUrl = URL.createObjectURL(new Blob([png], { type: "image/png" }));
+    historyThumbnailUrls.set(id, objectUrl);
+    image.src = objectUrl;
+  } catch (error) {
+    image.alt = "缩略图加载失败";
+    console.error("failed to load history thumbnail", error);
+  }
+}
+
+async function loadHistory(): Promise<void> {
+  const version = ++historyLoadVersion;
+  releaseHistoryThumbnails();
+  historyList.replaceChildren();
+  historySummary.textContent = "正在读取本地截图…";
+  try {
+    const query = historySearch.value.trim() || undefined;
+    const [items, usage] = await Promise.all([
+      listHistory(query, historyFavorites.checked),
+      getHistoryUsage(),
+    ]);
+    if (version !== historyLoadVersion || historyPanel.hidden) return;
+    historyStorage.textContent = `已用 ${formatBytes(usage.imageBytes)} / ${formatBytes(usage.maxImageBytes)} · ${usage.itemCount}/${usage.maxItems} 条`;
+    historyStorage.title = "达到任一上限后，SnapRust 会自动清理最旧的未收藏截图；收藏截图不会被自动删除。";
+    renderHistory(items);
+  } catch (error) {
+    if (version !== historyLoadVersion || historyPanel.hidden) return;
+    historySummary.textContent = "历史读取失败";
+    const message = document.createElement("p");
+    message.className = "history-empty";
+    message.textContent = `无法读取截图历史：${String(error)}`;
+    historyList.append(message);
+    console.error("failed to list screenshot history", error);
+  }
+}
+
+async function copyHistory(id: number, button: HTMLButtonElement): Promise<void> {
+  button.disabled = true;
+  const previous = button.textContent;
+  try {
+    await copyHistoryCapture(id);
+    button.textContent = "已复制";
+  } catch (error) {
+    button.textContent = "失败";
+    console.error("failed to copy history capture", error);
+  } finally {
+    window.setTimeout(() => {
+      button.textContent = previous;
+      button.disabled = false;
+    }, 1_100);
+  }
+}
+
+async function pinHistory(id: number, button: HTMLButtonElement): Promise<void> {
+  button.disabled = true;
+  const previous = button.textContent;
+  try {
+    await pinHistoryCapture(id);
+    button.textContent = "已钉";
+  } catch (error) {
+    button.textContent = "失败";
+    console.error("failed to pin history capture", error);
+  } finally {
+    window.setTimeout(() => {
+      button.textContent = previous;
+      button.disabled = false;
+    }, 1_100);
+  }
+}
+
+async function toggleHistoryFavorite(item: HistoryItemPayload, button: HTMLButtonElement): Promise<void> {
+  button.disabled = true;
+  try {
+    await setHistoryFavorite(item.id, !item.favorite);
+    void loadHistory();
+  } catch (error) {
+    button.disabled = false;
+    console.error("failed to update history favorite", error);
+  }
+}
+
+async function saveHistoryTags(id: number, tags: ReadonlyArray<string>, button: HTMLButtonElement): Promise<void> {
+  button.disabled = true;
+  try {
+    await setHistoryTags(id, tags);
+    void loadHistory();
+  } catch (error) {
+    button.disabled = false;
+    console.error("failed to update history tags", error);
+  }
+}
+
+async function removeHistory(item: HistoryItemPayload): Promise<void> {
+  if (!window.confirm(`永久删除 ${formatHistoryDate(item.createdAtMs)} 的截图吗？此操作不可恢复。`)) return;
+  try {
+    await deleteHistoryCapture(item.id);
+    void loadHistory();
+  } catch (error) {
+    console.error("failed to remove history capture", error);
+  }
+}
+
+async function setHistoryFavoritesInBatch(favorite: boolean): Promise<void> {
+  const ids = currentSelectedHistoryIds();
+  if (ids.length === 0) return;
+  historyBatchFavorite.disabled = true;
+  historyBatchUnfavorite.disabled = true;
+  historyBatchExport.disabled = true;
+  historyBatchDelete.disabled = true;
+  try {
+    await setHistoryFavoriteBatch(ids, favorite);
+    void loadHistory();
+  } catch (error) {
+    updateHistoryBatchControls();
+    console.error("failed to update history favorites in batch", error);
+  }
+}
+
+async function exportHistoryInBatch(): Promise<void> {
+  const ids = currentSelectedHistoryIds();
+  if (ids.length === 0) return;
+  historyBatchFavorite.disabled = true;
+  historyBatchUnfavorite.disabled = true;
+  historyBatchExport.disabled = true;
+  historyBatchDelete.disabled = true;
+  const previous = historyBatchExport.textContent;
+  historyBatchExport.textContent = "导出中…";
+  try {
+    const result = await exportHistoryCaptures(ids);
+    historyStorage.textContent = `已导出 ${result.exportedCount} 张到：${result.directory}`;
+    historyStorage.title = result.directory;
+  } catch (error) {
+    historyStorage.textContent = `历史导出失败：${String(error)}`;
+    historyStorage.title = "历史导出失败";
+    console.error("failed to export history captures", error);
+  } finally {
+    historyBatchExport.textContent = previous;
+    updateHistoryBatchControls();
+  }
+}
+
+async function removeHistoryInBatch(): Promise<void> {
+  const ids = currentSelectedHistoryIds();
+  if (ids.length === 0) return;
+  if (!window.confirm(`永久删除选中的 ${ids.length} 张截图吗？此操作不可恢复。`)) return;
+  historyBatchFavorite.disabled = true;
+  historyBatchUnfavorite.disabled = true;
+  historyBatchExport.disabled = true;
+  historyBatchDelete.disabled = true;
+  try {
+    await deleteHistoryCaptures(ids);
+    selectedHistoryIds.clear();
+    void loadHistory();
+  } catch (error) {
+    updateHistoryBatchControls();
+    console.error("failed to remove history captures in batch", error);
+  }
+}
+
+async function closeHistory(): Promise<void> {
+  if (historyPanel.hidden) return;
+  historyLoadVersion += 1;
+  releaseHistoryThumbnails();
+  historyPanel.hidden = true;
+  overlay.dataset.state = "idle";
+  try {
+    await hideHistoryWindow();
+  } catch (error) {
+    console.error("failed to hide history window", error);
+  }
 }
 
 function currentAnnotationWidth(): number {
@@ -175,6 +690,10 @@ function currentAnnotationWidth(): number {
 
 function setAnnotationTool(tool: AnnotationTool): void {
   if (tool !== "text") cancelTextEditor();
+  if (tool !== "crop") {
+    cropStart = null;
+    cropDraft = null;
+  }
   annotationTool = tool;
   document.querySelectorAll<HTMLButtonElement>("[data-tool]").forEach((button) => {
     const active = button.dataset.tool === tool;
@@ -182,6 +701,10 @@ function setAnnotationTool(tool: AnnotationTool): void {
     button.setAttribute("aria-pressed", String(active));
   });
   annotationCanvas.style.cursor = tool === "text" ? "text" : "crosshair";
+  annotationEditor.dataset.mode = tool === "crop" ? "cropping" : "";
+  annotationCropActions.hidden = tool !== "crop";
+  annotationCropApply.disabled = tool !== "crop" || cropDraft === null || cropInProgress;
+  if (selectedImage) scheduleAnnotationRender();
 }
 
 function cancelTextEditor(): void {
@@ -239,19 +762,72 @@ function openTextEditor(position: AnnotationPoint): void {
 
 function annotationPointFromEvent(event: PointerEvent): AnnotationPoint {
   const bounds = annotationCanvas.getBoundingClientRect();
+  const scale = Math.max(0.0001, annotationCanvas.clientWidth / Math.max(1, annotationCanvas.width));
+  const dx = (event.clientX - (bounds.left + bounds.width / 2)) / scale;
+  const dy = (event.clientY - (bounds.top + bounds.height / 2)) / scale;
+  let localX = dx;
+  let localY = dy;
+  switch (rotationQuarters) {
+    case 1:
+      localX = dy;
+      localY = -dx;
+      break;
+    case 2:
+      localX = -dx;
+      localY = -dy;
+      break;
+    case 3:
+      localX = -dy;
+      localY = dx;
+      break;
+    default:
+      break;
+  }
   return {
-    x: Math.max(0, Math.min(annotationCanvas.width, ((event.clientX - bounds.left) * annotationCanvas.width) / bounds.width)),
-    y: Math.max(0, Math.min(annotationCanvas.height, ((event.clientY - bounds.top) * annotationCanvas.height) / bounds.height)),
+    x: Math.max(0, Math.min(annotationCanvas.width, localX + annotationCanvas.width / 2)),
+    y: Math.max(0, Math.min(annotationCanvas.height, localY + annotationCanvas.height / 2)),
   };
 }
 
-function annotationRect(start: AnnotationPoint, end: AnnotationPoint) {
+function annotationRect(start: AnnotationPoint, end: AnnotationPoint): AnnotationRect {
   return {
     x: Math.min(start.x, end.x),
     y: Math.min(start.y, end.y),
     width: Math.abs(end.x - start.x),
     height: Math.abs(end.y - start.y),
   };
+}
+
+function drawCropOverlay(
+  context: CanvasRenderingContext2D,
+  rect: AnnotationRect,
+): void {
+  const right = Math.min(context.canvas.width, rect.x + rect.width);
+  const bottom = Math.min(context.canvas.height, rect.y + rect.height);
+  context.save();
+  context.fillStyle = "rgb(7 10 14 / 58%)";
+  context.fillRect(0, 0, context.canvas.width, Math.max(0, rect.y));
+  context.fillRect(0, bottom, context.canvas.width, Math.max(0, context.canvas.height - bottom));
+  context.fillRect(0, rect.y, Math.max(0, rect.x), Math.max(0, rect.height));
+  context.fillRect(right, rect.y, Math.max(0, context.canvas.width - right), Math.max(0, rect.height));
+  context.strokeStyle = "#8af0c9";
+  context.lineWidth = Math.max(2, Math.min(context.canvas.width, context.canvas.height) * 0.004);
+  context.setLineDash([8, 6]);
+  context.strokeRect(rect.x, rect.y, rect.width, rect.height);
+  context.setLineDash([]);
+
+  const label = `${Math.round(rect.width)} × ${Math.round(rect.height)}`;
+  context.font = '12px ui-monospace, SFMono-Regular, Consolas, monospace';
+  const labelWidth = context.measureText(label).width + 14;
+  const labelX = Math.max(4, Math.min(context.canvas.width - labelWidth - 4, rect.x));
+  const labelAbove = rect.y >= 26;
+  const labelY = labelAbove ? rect.y - 8 : Math.min(context.canvas.height - 4, bottom + 20);
+  context.fillStyle = "rgb(7 10 14 / 92%)";
+  context.fillRect(labelX, labelY - 15, labelWidth, 19);
+  context.fillStyle = "#f7f7f5";
+  context.textBaseline = "middle";
+  context.fillText(label, labelX + 7, labelY - 5);
+  context.restore();
 }
 
 function drawMosaic(
@@ -331,13 +907,81 @@ function drawAnnotation(annotation: Annotation, context: CanvasRenderingContext2
 }
 
 function updateAnnotationStatus(): void {
-  const performanceText = annotationPerformanceSummary
-    ? ` · ${annotationPerformanceSummary}`
-    : "";
-  annotationStatus.textContent = `${annotationCanvas.width} × ${annotationCanvas.height} · ${annotations.length} 个标注 · Rust 将在复制时合成${performanceText}`;
+  annotationStatus.textContent = `${annotationCanvas.width} × ${annotationCanvas.height} · ${annotations.length} 个标注`;
   annotationUndo.disabled = annotations.length === 0;
   annotationRedo.disabled = annotationRedoStack.length === 0;
   annotationClear.disabled = annotations.length === 0;
+}
+
+function updateAnnotationEditorLayout(imageWidth = annotationCanvas.width, imageHeight = annotationCanvas.height): void {
+  const availableWidth = Math.max(320, window.innerWidth - 32);
+  const ocrWidth = ocrPanel.hidden
+    ? 0
+    : Math.min(380, Math.max(280, Math.round(window.innerWidth * 0.32)));
+  const editorWidth = Math.min(
+    1180,
+    availableWidth,
+    Math.max(640, imageWidth + 36 + ocrWidth),
+  );
+  const editorHeight = Math.min(
+    Math.max(ocrPanel.hidden ? 260 : 480, imageHeight + 130),
+    Math.max(240, window.innerHeight - 32),
+  );
+  annotationEditor.style.setProperty("--annotation-editor-width", `${editorWidth}px`);
+  annotationEditor.style.setProperty("--annotation-editor-height", `${editorHeight}px`);
+}
+
+function applyAnnotationZoom(): void {
+  if (!selectedImage || annotationCanvas.width <= 0 || annotationCanvas.height <= 0) return;
+  const scale = Math.max(0.05, annotationZoomBaseScale * annotationZoomFactor);
+  annotationCanvas.style.width = `${Math.max(1, Math.round(annotationCanvas.width * scale))}px`;
+  annotationCanvas.style.height = `${Math.max(1, Math.round(annotationCanvas.height * scale))}px`;
+  annotationCanvas.style.maxWidth = "none";
+  annotationCanvas.style.maxHeight = "none";
+}
+
+function fitAnnotationCanvas(): void {
+  if (!selectedImage || annotationCanvas.width <= 0 || annotationCanvas.height <= 0) return;
+  const availableWidth = Math.max(1, annotationCanvasWrap.clientWidth - 36);
+  const availableHeight = Math.max(1, annotationCanvasWrap.clientHeight - 36);
+  annotationZoomBaseScale = Math.min(
+    1,
+    availableWidth / annotationCanvas.width,
+    availableHeight / annotationCanvas.height,
+  );
+  if (!Number.isFinite(annotationZoomBaseScale) || annotationZoomBaseScale <= 0) {
+    annotationZoomBaseScale = 1;
+  }
+  applyAnnotationZoom();
+}
+
+function setAnnotationZoom(percent: number): void {
+  const value = Math.max(50, Math.min(300, Math.round(percent / 10) * 10));
+  annotationZoomFactor = value / 100;
+  annotationZoom.value = String(value);
+  annotationZoomValue.textContent = `${value}%`;
+  applyAnnotationZoom();
+}
+
+function scheduleAnnotationCanvasFit(): void {
+  window.requestAnimationFrame(() => {
+    if (!annotationEditor.hidden) fitAnnotationCanvas();
+  });
+}
+
+function drawOcrHighlight(line: OcrLinePayload, context: CanvasRenderingContext2D): void {
+  const { x, y, width, height } = line.rect;
+  if (width <= 0 || height <= 0) return;
+
+  const padding = Math.max(2, Math.min(context.canvas.width, context.canvas.height) * 0.003);
+  context.save();
+  context.fillStyle = "rgb(67 217 163 / 20%)";
+  context.strokeStyle = "rgb(138 240 201 / 94%)";
+  context.lineWidth = Math.max(1, padding * 0.55);
+  context.setLineDash([Math.max(3, padding * 1.8), Math.max(2, padding)]);
+  context.fillRect(x - padding, y - padding, width + padding * 2, height + padding * 2);
+  context.strokeRect(x - padding / 2, y - padding / 2, width + padding, height + padding);
+  context.restore();
 }
 
 function renderAnnotationCanvas(): void {
@@ -345,7 +989,61 @@ function renderAnnotationCanvas(): void {
   if (!selectedImage) return;
   annotationContext.clearRect(0, 0, annotationCanvas.width, annotationCanvas.height);
   annotationContext.drawImage(committedAnnotationCanvas, 0, 0);
+  if (highlightedOcrLine) drawOcrHighlight(highlightedOcrLine, annotationContext);
   if (annotationDraft) drawAnnotation(annotationDraft, annotationContext);
+  if (annotationTool === "crop" && cropDraft) drawCropOverlay(annotationContext, cropDraft);
+}
+
+function setHighlightedOcrLine(line: OcrLinePayload | null): void {
+  if (highlightedOcrLine === line) return;
+  highlightedOcrLine = line;
+  scheduleAnnotationRender();
+}
+
+function scrollOcrLineIntoView(line: OcrLinePayload): void {
+  const canvasBounds = annotationCanvas.getBoundingClientRect();
+  if (canvasBounds.width <= 0 || canvasBounds.height <= 0) return;
+  const scale = canvasBounds.width / annotationCanvas.width;
+  const targetLeft = annotationCanvas.offsetLeft + (line.rect.x + line.rect.width / 2) * scale;
+  const targetTop = annotationCanvas.offsetTop + (line.rect.y + line.rect.height / 2) * scale;
+  annotationCanvasWrap.scrollTo({
+    left: Math.max(0, targetLeft - annotationCanvasWrap.clientWidth / 2),
+    top: Math.max(0, targetTop - annotationCanvasWrap.clientHeight / 2),
+    behavior: "smooth",
+  });
+}
+
+function renderOcrLines(lines: ReadonlyArray<OcrLinePayload>): void {
+  ocrLines.replaceChildren();
+  ocrLines.hidden = lines.length === 0;
+  if (lines.length === 0) {
+    highlightedOcrLine = null;
+    return;
+  }
+
+  lines.forEach((line, index) => {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ocr-line";
+    button.title = `定位第 ${index + 1} 行：${line.text}`;
+    button.setAttribute("aria-label", `定位第 ${index + 1} 行：${line.text || "未命名文字"}`);
+    const number = document.createElement("span");
+    number.className = "ocr-line__number";
+    number.textContent = String(index + 1);
+    const text = document.createElement("span");
+    text.className = "ocr-line__text";
+    text.textContent = line.text || "（未返回文字）";
+    button.append(number, text);
+    button.addEventListener("pointerenter", () => setHighlightedOcrLine(line));
+    button.addEventListener("pointerleave", () => setHighlightedOcrLine(null));
+    button.addEventListener("focus", () => setHighlightedOcrLine(line));
+    button.addEventListener("blur", () => setHighlightedOcrLine(null));
+    button.addEventListener("click", () => {
+      setHighlightedOcrLine(line);
+      scrollOcrLineIntoView(line);
+    });
+    ocrLines.append(button);
+  });
 }
 
 function scheduleAnnotationRender(): void {
@@ -420,11 +1118,17 @@ async function openAnnotationEditor(selected: SelectionPayload): Promise<Readonl
   annotationCanvas.height = selected.height;
   committedAnnotationCanvas.width = selected.width;
   committedAnnotationCanvas.height = selected.height;
+  rotationQuarters = 0;
+  annotationCanvas.style.transform = "";
   annotations = [];
   annotationRedoStack = [];
+  updateAnnotationEditorLayout(selected.width, selected.height);
   annotationEditor.hidden = false;
   overlay.dataset.state = "editing";
   rebuildCommittedAnnotationCanvas();
+  scheduleAnnotationCanvasFit();
+  void loadAvailableOcrLanguages();
+  void loadAvailableTranslationModels();
   return {
     pngIpcMs,
     decodeMs: performance.now() - decodeStarted,
@@ -432,63 +1136,363 @@ async function openAnnotationEditor(selected: SelectionPayload): Promise<Readonl
   };
 }
 
-function toPhysicalPoint(point: Point): Point | null {
-  if (!currentCapture) {
-    return null;
+function clearOcrResultsAfterCrop(): void {
+  ocrPanel.hidden = true;
+  ocrMeta.textContent = "等待识别";
+  ocrResult.value = "";
+  renderOcrLines([]);
+  ocrCopy.disabled = true;
+  ocrCopy.textContent = "复制文字";
+  translationResult.value = "";
+  translationMeta.textContent = "需要配置翻译服务";
+  translationCopy.disabled = true;
+  translationCopy.textContent = "复制译文";
+  translationRun.disabled = false;
+  ocrLanguage.disabled = !ocrLanguagesLoaded || ocrLanguage.options.length <= 1;
+}
+
+function cropRectForBackend(rect: AnnotationRect): SelectionCropRect {
+  const left = Math.max(0, Math.min(annotationCanvas.width, Math.floor(rect.x)));
+  const top = Math.max(0, Math.min(annotationCanvas.height, Math.floor(rect.y)));
+  const right = Math.max(left, Math.min(annotationCanvas.width, Math.ceil(rect.x + rect.width)));
+  const bottom = Math.max(top, Math.min(annotationCanvas.height, Math.ceil(rect.y + rect.height)));
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+async function applyCropSelection(): Promise<void> {
+  if (
+    !selectedCapture
+    || !cropDraft
+    || cropInProgress
+    || ocrInProgress
+    || translationInProgress
+    || copyInProgress
+    || pinInProgress
+  ) return;
+
+  const crop = cropRectForBackend(cropDraft);
+  if (crop.width === 0 || crop.height === 0) return;
+  if (annotations.length > 0 && !window.confirm("应用裁剪会清除当前标注，是否继续？")) return;
+
+  cropInProgress = true;
+  annotationCropApply.disabled = true;
+  annotationCropCancel.disabled = true;
+  annotationOcr.disabled = true;
+  annotationTranslate.disabled = true;
+  annotationPin.disabled = true;
+  annotationStatus.textContent = "正在应用裁剪…";
+  const version = captureSessionVersion;
+
+  try {
+    const cropped = await cropSelectedCapture(crop);
+    if (version !== captureSessionVersion) return;
+    const png = await getSelectedCaptureImage();
+    const objectUrl = URL.createObjectURL(new Blob([png], { type: "image/png" }));
+    const image = new Image();
+    image.src = objectUrl;
+    try {
+      await image.decode();
+    } catch (error) {
+      URL.revokeObjectURL(objectUrl);
+      throw error;
+    }
+    if (version !== captureSessionVersion) {
+      URL.revokeObjectURL(objectUrl);
+      return;
+    }
+
+    revokeObjectUrl(selectedImageObjectUrl);
+    selectedImageObjectUrl = objectUrl;
+    selectedImage = image;
+    selectedCapture = cropped;
+    annotationCanvas.width = cropped.width;
+    annotationCanvas.height = cropped.height;
+    committedAnnotationCanvas.width = cropped.width;
+    committedAnnotationCanvas.height = cropped.height;
+    rotationQuarters = 0;
+    annotationCanvas.style.transform = "";
+    annotations = [];
+    annotationRedoStack = [];
+    cropStart = null;
+    cropDraft = null;
+    setAnnotationTool("arrow");
+    clearOcrResultsAfterCrop();
+    updateAnnotationEditorLayout(cropped.width, cropped.height);
+    setAnnotationZoom(100);
+    rebuildCommittedAnnotationCanvas();
+    scheduleAnnotationCanvasFit();
+  } catch (error) {
+    annotationStatus.textContent = `裁剪失败：${String(error)}`;
+    console.error("failed to crop selected capture", error);
+  } finally {
+    cropInProgress = false;
+    annotationCropCancel.disabled = false;
+    annotationCropApply.disabled = cropDraft === null;
+    annotationOcr.disabled = false;
+    annotationTranslate.disabled = false;
+    annotationPin.disabled = false;
   }
-
-  const physical = selectionToPhysicalPixels(
-    {
-      x: point.x,
-      y: point.y,
-      width: 0,
-      height: 0,
-      viewportWidth: window.innerWidth,
-      viewportHeight: window.innerHeight,
-    },
-    currentCapture.width,
-    currentCapture.height,
-    currentCapture.desktop.x,
-    currentCapture.desktop.y,
-  );
-  return { x: physical.x, y: physical.y };
 }
 
-function monitorAt(point: Point): CapturePayload["desktop"]["monitors"][number] | undefined {
-  return currentCapture?.desktop.monitors.find(
-    (monitor) =>
-      point.x >= monitor.x &&
-      point.x < monitor.x + monitor.width &&
-      point.y >= monitor.y &&
-      point.y < monitor.y + monitor.height,
-  );
-}
+async function loadAvailableOcrLanguages(): Promise<void> {
+  if (ocrLanguagesLoaded || ocrLanguagesLoading) return;
 
-function updatePointerReadout(point: Point): void {
-  const physical = toPhysicalPoint(point);
-  if (!physical) {
-    capturePointer.textContent = "坐标：等待截图";
-    return;
+  ocrLanguagesLoading = true;
+  try {
+    const languages = await listOcrLanguages();
+    const previous = ocrLanguage.value;
+    ocrLanguage.replaceChildren();
+    const automatic = document.createElement("option");
+    automatic.value = "";
+    automatic.textContent = "自动（系统）";
+    ocrLanguage.append(automatic);
+    for (const language of languages) {
+      const option = document.createElement("option");
+      option.value = language.tag;
+      option.textContent = `${language.nativeName} · ${language.tag}`;
+      option.title = language.displayName;
+      ocrLanguage.append(option);
+    }
+    if ([...ocrLanguage.options].some((option) => option.value === previous)) {
+      ocrLanguage.value = previous;
+    }
+    ocrLanguagesLoaded = true;
+    ocrLanguage.disabled = ocrInProgress || languages.length === 0;
+  } catch (error) {
+    ocrLanguage.disabled = true;
+    console.error("failed to list Windows OCR languages", error);
+  } finally {
+    ocrLanguagesLoading = false;
   }
-
-  const monitor = monitorAt(physical);
-  const monitorText = monitor
-    ? `显示器 ${monitor.index}${monitor.isPrimary ? "（主）" : ""} · ${Math.round(monitor.scaleFactor * 100)}%`
-    : "显示器：未知";
-  capturePointer.textContent = `逻辑：${Math.round(point.x)}, ${Math.round(point.y)} · 物理：${physical.x}, ${physical.y} · ${monitorText}`;
 }
 
-function renderMonitorGuides(capture: CapturePayload): void {
-  monitorGuides.replaceChildren();
-  for (const monitor of capture.desktop.monitors) {
-    const guide = document.createElement("div");
-    guide.className = "monitor-guide";
-    guide.style.left = `${((monitor.x - capture.desktop.x) / capture.desktop.width) * 100}%`;
-    guide.style.top = `${((monitor.y - capture.desktop.y) / capture.desktop.height) * 100}%`;
-    guide.style.width = `${(monitor.width / capture.desktop.width) * 100}%`;
-    guide.style.height = `${(monitor.height / capture.desktop.height) * 100}%`;
-    guide.textContent = `显示器 ${monitor.index}${monitor.isPrimary ? " · 主" : ""} · ${Math.round(monitor.scaleFactor * 100)}%`;
-    monitorGuides.append(guide);
+function selectedTranslationProvider(): TranslationProviderPayload | undefined {
+  return translationProviders.find((provider) => provider.provider === settingsProvider.value);
+}
+
+function updateTranslationProviderFields(): void {
+  const provider = selectedTranslationProvider();
+  if (!provider) return;
+  settingsApiKeyLabel.textContent = provider.requiresApiKey
+    ? `${provider.displayName} API Key`
+    : `${provider.displayName} API Key（可选）`;
+  settingsApiKey.placeholder = provider.requiresApiKey
+    ? `请输入 ${provider.displayName} API Key`
+    : "本地服务通常无需 API Key";
+}
+
+async function loadAvailableTranslationProviders(): Promise<void> {
+  if (translationProviders.length > 0 || translationProvidersLoading) return;
+
+  translationProvidersLoading = true;
+  try {
+    const providers = await listTranslationProviders();
+    translationProviders = providers;
+    const previous = settingsProvider.value;
+    settingsProvider.replaceChildren();
+    for (const provider of providers) {
+      const option = document.createElement("option");
+      option.value = provider.provider;
+      option.textContent = provider.displayName;
+      option.title = provider.description;
+      settingsProvider.append(option);
+    }
+    if ([...settingsProvider.options].some((option) => option.value === previous)) {
+      settingsProvider.value = previous;
+    }
+    updateTranslationProviderFields();
+  } catch (error) {
+    console.error("failed to list translation providers", error);
+  } finally {
+    translationProvidersLoading = false;
+  }
+}
+
+async function loadAvailableTranslationModels(): Promise<void> {
+  if (translationModelsLoaded || translationModelsLoading) return;
+
+  translationModelsLoading = true;
+  try {
+    const models = await listTranslationModels();
+    const previous = translationModel.value;
+    translationModel.replaceChildren();
+    for (const model of models) {
+      const option = document.createElement("option");
+      option.value = model.model;
+      option.textContent = model.displayName;
+      option.title = `${model.provider} · ${model.model}`;
+      translationModel.append(option);
+    }
+    if ([...translationModel.options].some((option) => option.value === previous)) {
+      translationModel.value = previous;
+    }
+    translationModelsLoaded = true;
+  } catch (error) {
+    console.error("failed to list translation models", error);
+  } finally {
+    translationModelsLoading = false;
+  }
+}
+
+async function openTranslationSettings(): Promise<void> {
+  settingsPanel.hidden = false;
+  settingsStatus.textContent = "正在读取配置…";
+  try {
+    await loadAvailableTranslationProviders();
+    const config = await getTranslationConfig();
+    settingsProvider.value = config.provider;
+    updateTranslationProviderFields();
+    settingsModel.value = config.model;
+    settingsEndpoint.value = config.endpoint;
+    settingsApiKey.value = "";
+    settingsApiKeyHint.textContent = config.apiKeyConfigured
+      ? `已配置（${config.apiKeyHint ?? "已隐藏"}），留空保持不变`
+      : "尚未配置";
+    settingsClearKey.checked = false;
+    const provider = selectedTranslationProvider();
+    settingsStatus.textContent = `${provider?.description ?? "翻译服务"}。配置保存在 SnapRust 应用数据目录中。`;
+  } catch (error) {
+    settingsStatus.textContent = `读取配置失败：${String(error)}`;
+  }
+}
+
+function closeTranslationSettings(): void {
+  settingsRequestVersion += 1;
+  cancelActiveTranslationRequest();
+  settingsInProgress = false;
+  settingsSave.disabled = false;
+  settingsTest.disabled = false;
+  if (overlay.dataset.state === "settings") {
+    void cancel();
+  } else {
+    settingsPanel.hidden = true;
+  }
+}
+
+async function saveTranslationSettings(testConnection: boolean): Promise<void> {
+  if (settingsInProgress) return;
+  const requestVersion = ++settingsRequestVersion;
+  settingsInProgress = true;
+  settingsSave.disabled = true;
+  settingsTest.disabled = true;
+  settingsStatus.textContent = "正在保存配置…";
+  try {
+    const config = await saveTranslationConfig({
+      provider: settingsProvider.value,
+      apiKey: settingsApiKey.value || undefined,
+      clearApiKey: settingsClearKey.checked,
+      endpoint: settingsEndpoint.value,
+      model: settingsModel.value,
+    });
+    if (requestVersion !== settingsRequestVersion || settingsPanel.hidden) return;
+    settingsApiKey.value = "";
+    settingsClearKey.checked = false;
+    settingsApiKeyHint.textContent = config.apiKeyConfigured
+      ? `已配置（${config.apiKeyHint ?? "已隐藏"}），留空保持不变`
+      : "尚未配置";
+    translationModelsLoaded = false;
+    if (testConnection) {
+      settingsStatus.textContent = "配置已保存，正在测试 DeepSeek…";
+      const requestId = ++nextTranslationRequestId;
+      activeTranslationRequestId = requestId;
+      const result = await translateText(
+        "Hello, SnapRust",
+        "zh-Hans",
+        undefined,
+        config.model,
+        requestId,
+      );
+      if (
+        requestVersion !== settingsRequestVersion
+        || activeTranslationRequestId !== requestId
+        || settingsPanel.hidden
+      ) return;
+      activeTranslationRequestId = null;
+      settingsStatus.textContent = `测试成功：${result.text}`;
+    } else {
+      settingsStatus.textContent = "配置已保存，下次翻译时生效。";
+    }
+  } catch (error) {
+    if (requestVersion === settingsRequestVersion && !settingsPanel.hidden) {
+      settingsStatus.textContent = `保存或测试失败：${String(error)}`;
+    }
+  } finally {
+    if (requestVersion === settingsRequestVersion) {
+      settingsInProgress = false;
+      settingsSave.disabled = false;
+      settingsTest.disabled = false;
+    }
+  }
+}
+
+function hideImageContextMenu(): void {
+  imageContextMenu.hidden = true;
+}
+
+function showImageContextMenu(clientX: number, clientY: number): void {
+  imageContextMenu.hidden = false;
+  const margin = 8;
+  const left = Math.min(clientX, window.innerWidth - imageContextMenu.offsetWidth - margin);
+  const top = Math.min(clientY, window.innerHeight - imageContextMenu.offsetHeight - margin);
+  imageContextMenu.style.left = `${Math.max(margin, left)}px`;
+  imageContextMenu.style.top = `${Math.max(margin, top)}px`;
+}
+
+async function rotateSelectedImage(deltaQuarters: number): Promise<void> {
+  if (!selectedCapture) return;
+  try {
+    const rotation = await rotateSelectedCapture(deltaQuarters);
+    rotationQuarters = rotation.quarters;
+    annotationCanvas.style.transform = rotationQuarters === 0
+      ? ""
+      : `rotate(${rotationQuarters * 90}deg)`;
+    annotationStatus.textContent = `已旋转 ${rotationQuarters * 90}°；复制或钉图时会输出旋转后的图片`;
+  } catch (error) {
+    annotationStatus.textContent = `旋转失败：${String(error)}`;
+  }
+}
+
+async function handleImageContextAction(action: string): Promise<void> {
+  hideImageContextMenu();
+  switch (action) {
+    case "copy":
+      await copySelection();
+      break;
+    case "pin":
+      commitTextEditor();
+      await pinSelection();
+      break;
+    case "ocr":
+      commitTextEditor();
+      await recognizeSelection();
+      break;
+    case "translate":
+      await translateSelection();
+      break;
+    case "crop":
+      if (!cropInProgress && !ocrInProgress && !translationInProgress && !copyInProgress && !pinInProgress) {
+        setAnnotationTool("crop");
+      }
+      break;
+    case "rotate-left":
+      await rotateSelectedImage(-1);
+      break;
+    case "rotate-right":
+      await rotateSelectedImage(1);
+      break;
+    case "reset-rotation":
+      await rotateSelectedImage(-rotationQuarters);
+      break;
+    case "destroy":
+      await cancel();
+      break;
+    default:
+      break;
   }
 }
 
@@ -519,7 +1523,7 @@ function renderSelection(selection: SelectionRect): void {
   selectionBox.style.height = `${selection.height}px`;
   const physical = physicalSelectionSize(selection);
   selectionSize.textContent = physical
-    ? `逻辑 ${Math.round(selection.width)} × ${Math.round(selection.height)} · 像素 ${physical.width} × ${physical.height}`
+    ? `${physical.width} × ${physical.height}`
     : `${Math.round(selection.width)} × ${Math.round(selection.height)}`;
 }
 
@@ -540,7 +1544,6 @@ async function cancel(): Promise<void> {
 
 async function commitSelection(selection: SelectionRect): Promise<void> {
   const totalStarted = performance.now();
-  captureStatus.textContent = "正在生成选区…";
 
   try {
     if (!currentCapture) throw new Error("capture metadata is unavailable");
@@ -559,10 +1562,8 @@ async function commitSelection(selection: SelectionRect): Promise<void> {
     }
 
     selectedCapture = selected;
-    captureStatus.textContent = `${selected.width} × ${selected.height} · Ctrl+C 复制 · Esc 取消`;
     const editorPerformance = await openAnnotationEditor(selected);
     if (!editorPerformance) return;
-    annotationPerformanceSummary = `性能：裁剪 ${formatMilliseconds(selected.cropMs)} · 选区 PNG/IPC ${formatMilliseconds(editorPerformance.pngIpcMs)} · 解码 ${formatMilliseconds(editorPerformance.decodeMs)}`;
     updateAnnotationStatus();
     reportPerformance("selection", {
       rustCrop: selected.cropMs,
@@ -573,22 +1574,22 @@ async function commitSelection(selection: SelectionRect): Promise<void> {
     });
   } catch (error) {
     selectedCapture = null;
-    captureStatus.textContent = "选区生成失败，请重新拖动或按 Esc 取消";
     console.error("failed to crop capture selection", error);
   }
 }
 
 async function copySelection(): Promise<void> {
   commitTextEditor();
-  if (!selectedCapture || copyInProgress || pinInProgress) {
+  if (!selectedCapture || copyInProgress || pinInProgress || ocrInProgress) {
     return;
   }
 
   copyInProgress = true;
   annotationPin.disabled = true;
+  annotationOcr.disabled = true;
+  annotationTranslate.disabled = true;
   const totalStarted = performance.now();
   let annotationSyncMs = 0;
-  captureStatus.textContent = "正在复制到剪贴板…";
   if (!annotationEditor.hidden) annotationStatus.textContent = "正在由 Rust 合成并复制…";
 
   try {
@@ -597,7 +1598,8 @@ async function copySelection(): Promise<void> {
       await setCaptureAnnotations(annotations);
       annotationSyncMs = performance.now() - annotationStarted;
     }
-    const copied = await copySelectedCapture();
+    const ocrText = ocrPanel.hidden ? undefined : ocrResult.value.trim() || undefined;
+    const copied = await copySelectedCapture(ocrText);
     reportPerformance("copy", {
       annotationSync: annotationSyncMs,
       rustRender: copied.renderMs,
@@ -605,28 +1607,29 @@ async function copySelection(): Promise<void> {
       rustTotal: copied.totalMs,
       endToEnd: performance.now() - totalStarted,
     });
-    captureStatus.textContent = `已复制 ${copied.width} × ${copied.height}`;
     resetSelectionUi();
   } catch (error) {
-    captureStatus.textContent = "复制失败，请重试或按 Esc 取消";
     if (!annotationEditor.hidden) annotationStatus.textContent = `复制失败：${String(error)}`;
     console.error("failed to copy selected capture", error);
   } finally {
     copyInProgress = false;
     annotationPin.disabled = false;
+    annotationOcr.disabled = false;
+    annotationTranslate.disabled = false;
   }
 }
 
 async function pinSelection(): Promise<void> {
-  if (!selectedCapture || pinInProgress || copyInProgress) {
+  if (!selectedCapture || pinInProgress || copyInProgress || ocrInProgress) {
     return;
   }
 
   pinInProgress = true;
   annotationPin.disabled = true;
+  annotationOcr.disabled = true;
+  annotationTranslate.disabled = true;
   const totalStarted = performance.now();
   let annotationSyncMs = 0;
-  captureStatus.textContent = "正在创建钉图…";
   annotationStatus.textContent = "正在由 Rust 合成并创建置顶窗口…";
 
   try {
@@ -635,7 +1638,8 @@ async function pinSelection(): Promise<void> {
       await setCaptureAnnotations(annotations);
       annotationSyncMs = performance.now() - annotationStarted;
     }
-    const pinned = await pinSelectedCapture();
+    const ocrText = ocrPanel.hidden ? undefined : ocrResult.value.trim() || undefined;
+    const pinned = await pinSelectedCapture(ocrText);
     reportPerformance("pin", {
       annotationSync: annotationSyncMs,
       rustRender: pinned.renderMs,
@@ -644,20 +1648,206 @@ async function pinSelection(): Promise<void> {
       rustTotal: pinned.totalMs,
       endToEnd: performance.now() - totalStarted,
     });
-    captureStatus.textContent = `已钉住 ${pinned.width} × ${pinned.height}`;
     resetSelectionUi();
   } catch (error) {
-    captureStatus.textContent = "钉图失败，请重试或按 Esc 取消";
     annotationStatus.textContent = `钉图失败：${String(error)}`;
     console.error("failed to pin selected capture", error);
   } finally {
     pinInProgress = false;
     annotationPin.disabled = false;
+    annotationOcr.disabled = false;
+    annotationTranslate.disabled = false;
+  }
+}
+
+async function recognizeSelection(): Promise<boolean> {
+  if (!selectedCapture || ocrInProgress || copyInProgress || pinInProgress || translationInProgress) return false;
+
+  ocrInProgress = true;
+  const version = captureSessionVersion;
+  annotationOcr.disabled = true;
+  annotationPin.disabled = true;
+  annotationTranslate.disabled = true;
+  ocrPanel.hidden = false;
+  updateAnnotationEditorLayout();
+  scheduleAnnotationCanvasFit();
+  ocrMeta.textContent = "正在识别…";
+  ocrResult.value = "";
+  renderOcrLines([]);
+  ocrCopy.disabled = true;
+  translationResult.value = "";
+  translationMeta.textContent = "等待 OCR 结果";
+  translationCopy.disabled = true;
+  annotationStatus.textContent = "正在使用 Windows 本地 OCR 识别原始选区…";
+
+  try {
+    const result = await recognizeSelectedCapture(ocrLanguage.value || undefined);
+    if (version !== captureSessionVersion) return false;
+    ocrResult.value = result.text;
+    renderOcrLines(result.lines);
+    ocrCopy.disabled = result.text.trim().length === 0;
+    const resized = result.sourceWidth !== result.recognitionWidth || result.sourceHeight !== result.recognitionHeight;
+    const sizeText = resized
+      ? `${result.sourceWidth}×${result.sourceHeight} → ${result.recognitionWidth}×${result.recognitionHeight}`
+      : `${result.sourceWidth}×${result.sourceHeight}`;
+    ocrMeta.textContent = `${result.language} · ${result.lineCount} 行 · ${sizeText} · ${formatMilliseconds(result.durationMs)}`;
+    annotationStatus.textContent = result.text.trim()
+      ? `OCR 完成：识别到 ${result.lineCount} 行文字`
+      : "OCR 完成：选区中没有识别到文字";
+    reportPerformance("ocr", { windowsOcr: result.durationMs });
+    return result.text.trim().length > 0;
+  } catch (error) {
+    if (version !== captureSessionVersion) return false;
+    ocrMeta.textContent = "识别失败";
+    ocrResult.value = `OCR 失败：${String(error)}`;
+    renderOcrLines([]);
+    annotationStatus.textContent = "OCR 失败；请确认 Windows 已安装当前语言的 OCR 组件";
+    console.error("failed to recognize selected capture", error);
+    return false;
+  } finally {
+    if (version === captureSessionVersion) {
+      ocrInProgress = false;
+      annotationOcr.disabled = false;
+      annotationPin.disabled = false;
+      annotationTranslate.disabled = false;
+      ocrLanguage.disabled = !ocrLanguagesLoaded || ocrLanguage.options.length <= 1;
+    }
+  }
+}
+
+async function copyOcrResult(): Promise<void> {
+  const text = ocrResult.value;
+  if (!text.trim() || ocrCopy.disabled) return;
+
+  ocrCopy.disabled = true;
+  try {
+    await copyText(text);
+    ocrCopy.textContent = "已复制";
+    annotationStatus.textContent = "OCR 文字已复制到剪贴板";
+  } catch (error) {
+    ocrCopy.textContent = "复制失败";
+    annotationStatus.textContent = `OCR 文字复制失败：${String(error)}`;
+  } finally {
+    window.setTimeout(() => {
+      ocrCopy.textContent = "复制文字";
+      ocrCopy.disabled = !ocrResult.value.trim();
+    }, 1_200);
+  }
+}
+
+async function translateSelection(): Promise<void> {
+  if (!selectedCapture || translationInProgress || copyInProgress || pinInProgress) return;
+
+  commitTextEditor();
+  annotationTranslate.disabled = true;
+  const hasOcrText = ocrResult.value.trim().length > 0;
+  if (!hasOcrText) {
+    const recognized = await recognizeSelection();
+    if (!recognized || !selectedCapture) {
+      annotationTranslate.disabled = false;
+      return;
+    }
+  }
+
+  translationInProgress = true;
+  ocrPanel.hidden = false;
+  updateAnnotationEditorLayout();
+  scheduleAnnotationCanvasFit();
+  translationRun.disabled = true;
+  translationCopy.disabled = true;
+  translationResult.value = "";
+  translationMeta.textContent = "正在翻译…";
+  annotationOcr.disabled = true;
+  annotationPin.disabled = true;
+  annotationStatus.textContent = "正在翻译 OCR 文字…";
+  const version = captureSessionVersion;
+  const requestId = ++nextTranslationRequestId;
+  activeTranslationRequestId = requestId;
+
+  try {
+    const translated = await translateText(
+      ocrResult.value,
+      translationTarget.value,
+      undefined,
+      translationModel.value || undefined,
+      requestId,
+    );
+    if (version !== captureSessionVersion || activeTranslationRequestId !== requestId) return;
+    activeTranslationRequestId = null;
+    translationResult.value = translated.text;
+    translationCopy.disabled = translated.text.trim().length === 0;
+    translationMeta.textContent = `${translated.provider}/${translated.model} · ${translated.sourceLanguage ?? "自动"} → ${translated.targetLanguage} · ${formatMilliseconds(translated.durationMs)}`;
+    annotationStatus.textContent = "翻译完成，可复制译文";
+    reportPerformance("translation", { translator: translated.durationMs });
+  } catch (error) {
+    if (version !== captureSessionVersion || activeTranslationRequestId !== requestId) return;
+    translationMeta.textContent = "翻译失败";
+    translationResult.value = `翻译失败：${String(error)}`;
+    annotationStatus.textContent = "翻译失败；请检查翻译服务配置和网络连接";
+    console.error("failed to translate OCR result", error);
+  } finally {
+    if (activeTranslationRequestId === requestId) activeTranslationRequestId = null;
+    if (version === captureSessionVersion) {
+      translationInProgress = false;
+      translationRun.disabled = false;
+      annotationTranslate.disabled = false;
+      annotationOcr.disabled = false;
+      annotationPin.disabled = false;
+    }
+  }
+}
+
+async function copyTranslationResult(): Promise<void> {
+  const text = translationResult.value;
+  if (!text.trim() || translationCopy.disabled) return;
+
+  translationCopy.disabled = true;
+  try {
+    await copyText(text);
+    translationCopy.textContent = "已复制";
+    annotationStatus.textContent = "译文已复制到剪贴板";
+  } catch (error) {
+    translationCopy.textContent = "复制失败";
+    annotationStatus.textContent = `译文复制失败：${String(error)}`;
+  } finally {
+    window.setTimeout(() => {
+      translationCopy.textContent = "复制译文";
+      translationCopy.disabled = !translationResult.value.trim();
+    }, 1_200);
   }
 }
 
 window.addEventListener("keydown", (event) => {
+  if (!settingsPanel.hidden && event.key === "Escape") {
+    event.preventDefault();
+    closeTranslationSettings();
+    return;
+  }
+  if (!imageContextMenu.hidden && event.key === "Escape") {
+    event.preventDefault();
+    hideImageContextMenu();
+    return;
+  }
+  if (!historyPanel.hidden && event.key === "Escape") {
+    event.preventDefault();
+    void closeHistory();
+    return;
+  }
   if (annotationTextEditor.contains(event.target as Node)) return;
+  if (ocrPanel.contains(event.target as Node) && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "c") return;
+
+  if (!annotationEditor.hidden && annotationTool === "crop") {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      setAnnotationTool("arrow");
+      return;
+    }
+    if (event.key === "Enter" && cropDraft) {
+      event.preventDefault();
+      void applyCropSelection();
+      return;
+    }
+  }
 
   if (event.key === "Escape") {
     event.preventDefault();
@@ -673,6 +1863,25 @@ window.addEventListener("keydown", (event) => {
     event.preventDefault();
     void copySelection();
     return;
+  }
+
+  if (!annotationEditor.hidden && (event.ctrlKey || event.metaKey)) {
+    if (event.key === "+" || event.key === "=") {
+      event.preventDefault();
+      setAnnotationZoom(Number(annotationZoom.value) + 10);
+      return;
+    }
+    if (event.key === "-") {
+      event.preventDefault();
+      setAnnotationZoom(Number(annotationZoom.value) - 10);
+      return;
+    }
+    if (event.key === "0") {
+      event.preventDefault();
+      setAnnotationZoom(100);
+      scheduleAnnotationCanvasFit();
+      return;
+    }
   }
 
   if (!annotationEditor.hidden && (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "z") {
@@ -702,9 +1911,22 @@ window.addEventListener("keydown", (event) => {
 });
 
 window.addEventListener("contextmenu", (event) => {
-  if (annotationTextEditor.contains(event.target as Node)) return;
+  if (
+    annotationTextEditor.contains(event.target as Node)
+    || settingsPanel.contains(event.target as Node)
+    || historyPanel.contains(event.target as Node)
+  ) return;
+  if (selectedCapture && annotationCanvasWrap.contains(event.target as Node)) {
+    event.preventDefault();
+    showImageContextMenu(event.clientX, event.clientY);
+    return;
+  }
   event.preventDefault();
   void cancel();
+});
+
+window.addEventListener("pointerdown", (event) => {
+  if (!imageContextMenu.contains(event.target as Node)) hideImageContextMenu();
 });
 
 overlay.addEventListener("pointerdown", (event) => {
@@ -716,7 +1938,6 @@ overlay.addEventListener("pointerdown", (event) => {
   activePointerId = event.pointerId;
   selectedCapture = null;
   currentSelection = createSelection(dragStart, dragStart);
-  updatePointerReadout(dragStart);
   overlay.setPointerCapture(event.pointerId);
   renderSelection(currentSelection);
   event.preventDefault();
@@ -738,7 +1959,6 @@ overlay.addEventListener("pointerup", (event) => {
   }
 
   const selection = createSelection(dragStart, pointFromEvent(event));
-  updatePointerReadout(pointFromEvent(event));
   dragStart = null;
   activePointerId = null;
   if (overlay.hasPointerCapture(event.pointerId)) {
@@ -749,7 +1969,6 @@ overlay.addEventListener("pointerup", (event) => {
   renderSelection(selection);
   if (!selectionHasArea(selection)) {
     selectedCapture = null;
-    captureStatus.textContent = "选区太小，请重新拖动";
     event.preventDefault();
     return;
   }
@@ -764,15 +1983,53 @@ overlay.addEventListener("pointercancel", () => {
   currentSelection = null;
   selectedCapture = null;
   overlay.dataset.hasSelection = "false";
-  captureStatus.textContent = "选择已取消，请重新拖动";
-});
-
-overlay.addEventListener("pointermove", (event) => {
-  updatePointerReadout(pointFromEvent(event));
 });
 
 document.querySelectorAll<HTMLButtonElement>("[data-tool]").forEach((button) => {
-  button.addEventListener("click", () => setAnnotationTool(button.dataset.tool as AnnotationTool));
+  button.addEventListener("click", () => {
+    if (
+      button.dataset.tool === "crop"
+      && (cropInProgress || ocrInProgress || translationInProgress || copyInProgress || pinInProgress)
+    ) return;
+    setAnnotationTool(button.dataset.tool as AnnotationTool);
+  });
+});
+
+settingsProvider.addEventListener("change", () => {
+  const provider = selectedTranslationProvider();
+  if (!provider) return;
+  settingsModel.value = provider.defaultModel;
+  settingsEndpoint.value = provider.defaultEndpoint;
+  settingsApiKey.value = "";
+  settingsClearKey.checked = false;
+  settingsApiKeyHint.textContent = provider.requiresApiKey
+    ? "保存后将使用该提供商的密钥"
+    : "该提供商通常不需要 API Key";
+  updateTranslationProviderFields();
+  settingsStatus.textContent = `${provider.description}。请检查模型和端点后保存。`;
+  translationModelsLoaded = false;
+});
+settingsClose.addEventListener("pointerdown", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  closeTranslationSettings();
+});
+settingsClose.addEventListener("click", (event) => {
+  event.stopPropagation();
+  closeTranslationSettings();
+});
+settingsPanel.addEventListener("pointerdown", (event) => event.stopPropagation());
+settingsPanel.addEventListener("click", (event) => event.stopPropagation());
+translationSettingsForm.addEventListener("submit", (event) => {
+  event.preventDefault();
+  void saveTranslationSettings(false);
+});
+settingsTest.addEventListener("click", () => void saveTranslationSettings(true));
+settingsClearKey.addEventListener("change", () => {
+  if (settingsClearKey.checked) settingsApiKey.value = "";
+});
+imageContextMenu.querySelectorAll<HTMLButtonElement>("[data-image-action]").forEach((button) => {
+  button.addEventListener("click", () => void handleImageContextAction(button.dataset.imageAction ?? ""));
 });
 
 annotationWidth.addEventListener("input", () => {
@@ -800,10 +2057,114 @@ annotationClear.addEventListener("click", () => {
   rebuildCommittedAnnotationCanvas();
 });
 
+annotationCropCancel.addEventListener("click", () => setAnnotationTool("arrow"));
+annotationCropApply.addEventListener("click", () => void applyCropSelection());
+
 annotationPin.addEventListener("click", () => {
   commitTextEditor();
   void pinSelection();
 });
+
+annotationOcr.addEventListener("click", () => {
+  commitTextEditor();
+  void recognizeSelection();
+});
+
+annotationTranslate.addEventListener("click", () => void translateSelection());
+
+ocrCopy.addEventListener("click", () => void copyOcrResult());
+translationRun.addEventListener("click", () => void translateSelection());
+translationCopy.addEventListener("click", () => void copyTranslationResult());
+
+function markTranslationSettingsChanged(): void {
+  if (!translationResult.value.trim()) return;
+  translationMeta.textContent = "目标语言或模型已修改，请重新翻译";
+  translationCopy.disabled = true;
+}
+
+translationTarget.addEventListener("change", markTranslationSettingsChanged);
+translationModel.addEventListener("change", markTranslationSettingsChanged);
+
+ocrResult.addEventListener("input", () => {
+  ocrCopy.disabled = !ocrResult.value.trim();
+  ocrCopy.textContent = "复制文字";
+  translationResult.value = "";
+  translationMeta.textContent = "文字已修改，请重新翻译";
+  translationCopy.disabled = true;
+  translationCopy.textContent = "复制译文";
+});
+
+ocrLanguage.addEventListener("change", () => {
+  if (!ocrPanel.hidden) void recognizeSelection();
+});
+
+ocrClose.addEventListener("click", () => {
+  ocrPanel.hidden = true;
+  updateAnnotationEditorLayout();
+  scheduleAnnotationCanvasFit();
+  renderOcrLines([]);
+});
+
+annotationZoom.addEventListener("input", () => setAnnotationZoom(Number(annotationZoom.value)));
+annotationZoomOut.addEventListener("click", () => setAnnotationZoom(Number(annotationZoom.value) - 10));
+annotationZoomIn.addEventListener("click", () => setAnnotationZoom(Number(annotationZoom.value) + 10));
+annotationZoomFit.addEventListener("click", () => {
+  setAnnotationZoom(100);
+  scheduleAnnotationCanvasFit();
+});
+
+annotationCanvasWrap.addEventListener("wheel", (event) => {
+  if (annotationEditor.hidden || (!event.ctrlKey && !event.metaKey)) return;
+  event.preventDefault();
+  setAnnotationZoom(Number(annotationZoom.value) + (event.deltaY < 0 ? 10 : -10));
+}, { passive: false });
+
+window.addEventListener("resize", () => {
+  if (!annotationEditor.hidden) updateAnnotationEditorLayout();
+  if (!annotationEditor.hidden) scheduleAnnotationCanvasFit();
+});
+
+historyClose.addEventListener("pointerdown", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+  void closeHistory();
+});
+historyClose.addEventListener("click", (event) => {
+  event.stopPropagation();
+  void closeHistory();
+});
+historyPanel.addEventListener("pointerdown", (event) => event.stopPropagation());
+historyPanel.addEventListener("click", (event) => event.stopPropagation());
+historyPanel.addEventListener("contextmenu", (event) => {
+  event.preventDefault();
+  event.stopPropagation();
+});
+
+historySearch.addEventListener("input", () => {
+  if (historySearchTimer !== null) window.clearTimeout(historySearchTimer);
+  historySearchTimer = window.setTimeout(() => {
+    historySearchTimer = null;
+    void loadHistory();
+  }, 180);
+});
+
+historyFavorites.addEventListener("change", () => void loadHistory());
+
+historySelectAll.addEventListener("change", () => {
+  selectedHistoryIds.clear();
+  if (historySelectAll.checked) {
+    historyVisibleIds.forEach((id) => selectedHistoryIds.add(id));
+  }
+  document.querySelectorAll<HTMLInputElement>(".history-card__select input").forEach((input) => {
+    input.checked = selectedHistoryIds.has(Number(input.dataset.historyId));
+  });
+  updateHistoryBatchControls();
+});
+
+historyBatchFavorite.addEventListener("click", () => void setHistoryFavoritesInBatch(true));
+historyBatchUnfavorite.addEventListener("click", () => void setHistoryFavoritesInBatch(false));
+historyBatchExport.addEventListener("click", () => void exportHistoryInBatch());
+historyBatchDelete.addEventListener("click", () => void removeHistoryInBatch());
 
 annotationTextEditor.addEventListener("pointerdown", (event) => event.stopPropagation());
 annotationTextEditor.addEventListener("contextmenu", (event) => event.stopPropagation());
@@ -836,6 +2197,18 @@ annotationCanvas.addEventListener("pointerdown", (event) => {
     openTextEditor(point);
     return;
   }
+  if (annotationTool === "crop") {
+    if (cropInProgress) return;
+    annotationStart = null;
+    annotationDraft = null;
+    cropStart = point;
+    cropDraft = annotationRect(point, point);
+    annotationPointerId = event.pointerId;
+    annotationCanvas.setPointerCapture(event.pointerId);
+    annotationCropApply.disabled = true;
+    scheduleAnnotationRender();
+    return;
+  }
 
   annotationStart = point;
   annotationPointerId = event.pointerId;
@@ -852,6 +2225,13 @@ annotationCanvas.addEventListener("pointerdown", (event) => {
 });
 
 annotationCanvas.addEventListener("pointermove", (event) => {
+  if (annotationTool === "crop" && cropStart && event.pointerId === annotationPointerId) {
+    event.stopPropagation();
+    cropDraft = annotationRect(cropStart, annotationPointFromEvent(event));
+    annotationCropApply.disabled = cropDraft.width < 1 || cropDraft.height < 1 || cropInProgress;
+    scheduleAnnotationRender();
+    return;
+  }
   if (!annotationStart || event.pointerId !== annotationPointerId || !annotationDraft) return;
   event.stopPropagation();
   const point = annotationPointFromEvent(event);
@@ -876,6 +2256,16 @@ annotationCanvas.addEventListener("pointermove", (event) => {
 });
 
 annotationCanvas.addEventListener("pointerup", (event) => {
+  if (annotationTool === "crop" && cropStart && event.pointerId === annotationPointerId) {
+    event.stopPropagation();
+    cropDraft = annotationRect(cropStart, annotationPointFromEvent(event));
+    cropStart = null;
+    annotationPointerId = null;
+    if (annotationCanvas.hasPointerCapture(event.pointerId)) annotationCanvas.releasePointerCapture(event.pointerId);
+    annotationCropApply.disabled = cropDraft.width < 1 || cropDraft.height < 1 || cropInProgress;
+    scheduleAnnotationRender();
+    return;
+  }
   if (event.pointerId !== annotationPointerId || !annotationDraft) return;
   event.stopPropagation();
   if (annotationCanvas.hasPointerCapture(event.pointerId)) annotationCanvas.releasePointerCapture(event.pointerId);
@@ -900,6 +2290,14 @@ annotationCanvas.addEventListener("pointerup", (event) => {
 
 annotationCanvas.addEventListener("pointercancel", (event) => {
   if (event.pointerId !== annotationPointerId) return;
+  if (annotationTool === "crop") {
+    cropStart = null;
+    cropDraft = null;
+    annotationPointerId = null;
+    annotationCropApply.disabled = true;
+    scheduleAnnotationRender();
+    return;
+  }
   annotationStart = null;
   annotationDraft = null;
   annotationPointerId = null;
@@ -911,12 +2309,8 @@ await listen("capture://reset", async () => {
   resetSelectionUi();
   const version = captureSessionVersion;
   overlay.dataset.state = "loading";
-  captureStatus.textContent = "正在载入屏幕截图…";
   captureReady = false;
   currentCapture = null;
-  monitorGuides.replaceChildren();
-  captureDesktop.textContent = "正在读取虚拟桌面…";
-  capturePointer.textContent = "坐标：等待截图";
 
   try {
     const metadataStarted = performance.now();
@@ -945,10 +2339,7 @@ await listen("capture://reset", async () => {
     revokeObjectUrl(captureImageObjectUrl);
     captureImageObjectUrl = objectUrl;
     currentCapture = capture;
-    renderMonitorGuides(capture);
     const decodeMs = performance.now() - decodeStarted;
-    captureDesktop.textContent = `虚拟桌面：(${capture.desktop.x}, ${capture.desktop.y}) ${capture.width} × ${capture.height} · ${capture.desktop.monitors.length} 个显示器 · 性能：抓屏 ${formatMilliseconds(capture.captureMs)} · PNG/IPC ${formatMilliseconds(pngIpcMs)} · 解码 ${formatMilliseconds(decodeMs)}`;
-    captureStatus.textContent = `${capture.width} × ${capture.height} · ${capture.desktop.monitors.length} 屏 · 拖动选择区域`;
 
     // Decode while hidden, then reveal a transparent WebView2 surface first.
     // Hidden WebViews can throttle animation frames, so the two-frame compositor
@@ -977,9 +2368,26 @@ await listen("capture://reset", async () => {
     } catch (cleanupError) {
       console.error("failed to clear an incomplete screen capture", cleanupError);
     }
-    captureStatus.textContent = "截图载入失败，请重新触发快捷键";
     console.error("failed to load current screen capture", error);
   }
 });
 
-window.addEventListener("beforeunload", releaseImageResources);
+await listen("history://show", () => {
+  resetSelectionUi();
+  overlay.dataset.state = "history";
+  historyPanel.hidden = false;
+  void loadHistory();
+  window.requestAnimationFrame(() => historySearch.focus());
+});
+
+await listen("settings://show", () => {
+  resetSelectionUi();
+  overlay.dataset.state = "settings";
+  void openTranslationSettings();
+  window.requestAnimationFrame(() => settingsApiKey.focus());
+});
+
+window.addEventListener("beforeunload", () => {
+  releaseImageResources();
+  releaseHistoryThumbnails();
+});

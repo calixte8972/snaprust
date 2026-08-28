@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
     time::Instant,
@@ -9,7 +9,13 @@ use std::{
 
 use image::RgbaImage;
 use serde::Serialize;
-use tauri::{AppHandle, Manager, Runtime, WebviewUrl, WebviewWindowBuilder, WindowEvent};
+use tauri::{AppHandle, Manager, Runtime};
+
+#[cfg(not(windows))]
+use tauri::{WebviewUrl, WebviewWindowBuilder, WindowEvent};
+
+#[cfg(windows)]
+mod native;
 
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,10 +52,30 @@ struct PinnedImage {
 #[derive(Default)]
 pub struct PinStore {
     next_id: AtomicU64,
-    images: Mutex<HashMap<String, PinnedImage>>,
+    images: Arc<Mutex<HashMap<String, PinnedImage>>>,
+}
+
+#[cfg(windows)]
+fn clamp_native_axis(
+    desired: i32,
+    window_extent: i32,
+    work_start: i32,
+    work_extent: i32,
+    minimum_visible: i32,
+) -> i32 {
+    if window_extent <= work_extent {
+        desired.clamp(work_start, work_start + work_extent - window_extent)
+    } else {
+        let visible = minimum_visible.min(window_extent).min(work_extent).max(1);
+        desired.clamp(
+            work_start + visible - window_extent,
+            work_start + work_extent - visible,
+        )
+    }
 }
 
 impl PinStore {
+    #[cfg(any(not(windows), test))]
     fn insert(&self, image: &RgbaImage) -> Result<PinCreatedPayload, String> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
         let label = format!("pin-{id}");
@@ -71,6 +97,32 @@ impl PinStore {
             height: image.height(),
             render_ms: 0.0,
             png_encode_ms,
+            window_create_ms: 0.0,
+            total_ms: 0.0,
+        })
+    }
+
+    #[cfg(windows)]
+    fn insert_native(&self, image: &RgbaImage) -> Result<PinCreatedPayload, String> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
+        let label = format!("pin-{id}");
+        self.images
+            .lock()
+            .map_err(|_| "pin store lock is poisoned".to_owned())?
+            .insert(
+                label.clone(),
+                PinnedImage {
+                    png: Vec::new(),
+                    width: image.width(),
+                    height: image.height(),
+                },
+            );
+        Ok(PinCreatedPayload {
+            label,
+            width: image.width(),
+            height: image.height(),
+            render_ms: 0.0,
+            png_encode_ms: 0.0,
             window_create_ms: 0.0,
             total_ms: 0.0,
         })
@@ -121,6 +173,9 @@ pub fn create_pin<R: Runtime>(
     image: RgbaImage,
 ) -> Result<PinCreatedPayload, String> {
     let store = app.state::<PinStore>();
+    #[cfg(windows)]
+    let mut payload = store.insert_native(&image)?;
+    #[cfg(not(windows))]
     let mut payload = store.insert(&image)?;
     let label = payload.label.clone();
     let scale = (960.0 / f64::from(payload.width))
@@ -129,42 +184,65 @@ pub fn create_pin<R: Runtime>(
     let initial_width = (f64::from(payload.width) * scale).max(1.0);
     let initial_height = (f64::from(payload.height) * scale).max(1.0);
 
-    let window_started = Instant::now();
-    let build_result = WebviewWindowBuilder::new(app, &label, WebviewUrl::App("pin.html".into()))
-        .title("SnapRust 钉图")
-        .inner_size(initial_width, initial_height)
-        .visible(false)
-        .decorations(false)
-        .always_on_top(true)
-        .skip_taskbar(true)
-        .resizable(false)
-        .shadow(false)
-        .center()
-        .build();
-
-    let window = match build_result {
-        Ok(window) => window,
-        Err(error) => {
+    #[cfg(windows)]
+    {
+        let window_started = Instant::now();
+        let result = native::create(
+            label.clone(),
+            image,
+            store.images.clone(),
+            initial_width.round() as i32,
+            initial_height.round() as i32,
+        );
+        if let Err(error) = result {
             let _ = store.remove(&label);
-            return Err(format!("failed to create pin window: {error}"));
+            return Err(error);
         }
-    };
-    if let Err(error) = apply_window_opacity(&window, 0.0) {
-        let _ = window.close();
-        let _ = store.remove(&label);
-        return Err(error);
+        payload.window_create_ms = crate::screenshot::elapsed_ms(window_started);
+        Ok(payload)
     }
-    payload.window_create_ms = crate::screenshot::elapsed_ms(window_started);
 
-    let cleanup_app = app.clone();
-    let cleanup_label = label;
-    window.on_window_event(move |event| {
-        if matches!(event, WindowEvent::Destroyed) {
-            let _ = cleanup_app.state::<PinStore>().remove(&cleanup_label);
+    #[cfg(not(windows))]
+    {
+        let window_started = Instant::now();
+        let build_result =
+            WebviewWindowBuilder::new(app, &label, WebviewUrl::App("pin.html".into()))
+                .title("SnapRust 钉图")
+                .inner_size(initial_width, initial_height)
+                .visible(false)
+                .transparent(true)
+                .decorations(false)
+                .always_on_top(true)
+                .skip_taskbar(true)
+                .resizable(false)
+                .shadow(false)
+                .center()
+                .build();
+
+        let window = match build_result {
+            Ok(window) => window,
+            Err(error) => {
+                let _ = store.remove(&label);
+                return Err(format!("failed to create pin window: {error}"));
+            }
+        };
+        if let Err(error) = apply_window_opacity(&window, 0.0) {
+            let _ = window.close();
+            let _ = store.remove(&label);
+            return Err(error);
         }
-    });
+        payload.window_create_ms = crate::screenshot::elapsed_ms(window_started);
 
-    Ok(payload)
+        let cleanup_app = app.clone();
+        let cleanup_label = label;
+        window.on_window_event(move |event| {
+            if matches!(event, WindowEvent::Destroyed) {
+                let _ = cleanup_app.state::<PinStore>().remove(&cleanup_label);
+            }
+        });
+
+        Ok(payload)
+    }
 }
 
 fn pin_window<R: Runtime>(
@@ -176,6 +254,17 @@ fn pin_window<R: Runtime>(
     }
     app.get_webview_window(label)
         .ok_or_else(|| format!("pin window does not exist: {label}"))
+}
+
+fn target_outer_extent(
+    target_inner: u32,
+    current_inner: u32,
+    current_outer: u32,
+) -> Result<i32, String> {
+    target_inner
+        .checked_add(current_outer.saturating_sub(current_inner))
+        .and_then(|value| i32::try_from(value).ok())
+        .ok_or_else(|| "pin window extent is too large".to_owned())
 }
 
 pub fn warmup_pin_window<R: Runtime>(app: &AppHandle<R>, label: &str) -> Result<(), String> {
@@ -196,12 +285,93 @@ pub fn reveal_pin_window<R: Runtime>(app: &AppHandle<R>, label: &str) -> Result<
     apply_window_opacity(&window, 1.0)
 }
 
-pub fn close_pin<R: Runtime>(app: &AppHandle<R>, label: &str) -> Result<(), String> {
+pub fn set_pin_window_geometry<R: Runtime>(
+    app: &AppHandle<R>,
+    label: &str,
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+) -> Result<(), String> {
+    if width == 0 || height == 0 {
+        return Err("pin window size must be non-zero".to_owned());
+    }
     let window = pin_window(app, label)?;
-    window
-        .close()
-        .map_err(|error| format!("failed to close pin window: {error}"))?;
-    app.state::<PinStore>().remove(label)
+
+    #[cfg(windows)]
+    {
+        use windows::Win32::{
+            Foundation::RECT,
+            UI::WindowsAndMessaging::{
+                GetClientRect, GetWindowRect, SWP_NOACTIVATE, SWP_NOZORDER, SetWindowPos,
+            },
+        };
+
+        let hwnd = window
+            .hwnd()
+            .map_err(|error| format!("failed to get pin HWND: {error}"))?;
+        let mut inner = RECT::default();
+        let mut outer = RECT::default();
+
+        unsafe {
+            GetClientRect(hwnd, &mut inner)
+                .map_err(|error| format!("failed to read pin client rectangle: {error}"))?;
+            GetWindowRect(hwnd, &mut outer)
+                .map_err(|error| format!("failed to read pin window rectangle: {error}"))?;
+            let inner_width = u32::try_from(inner.right.saturating_sub(inner.left))
+                .map_err(|_| "pin client width is invalid".to_owned())?;
+            let inner_height = u32::try_from(inner.bottom.saturating_sub(inner.top))
+                .map_err(|_| "pin client height is invalid".to_owned())?;
+            let outer_width = u32::try_from(outer.right.saturating_sub(outer.left))
+                .map_err(|_| "pin window width is invalid".to_owned())?;
+            let outer_height = u32::try_from(outer.bottom.saturating_sub(outer.top))
+                .map_err(|_| "pin window height is invalid".to_owned())?;
+            let target_outer_width = target_outer_extent(width, inner_width, outer_width)?;
+            let target_outer_height = target_outer_extent(height, inner_height, outer_height)?;
+            SetWindowPos(
+                hwnd,
+                None,
+                x,
+                y,
+                target_outer_width,
+                target_outer_height,
+                SWP_NOACTIVATE | SWP_NOZORDER,
+            )
+            .map_err(|error| format!("failed to update pin window geometry: {error}"))?;
+        }
+        Ok(())
+    }
+
+    #[cfg(not(windows))]
+    {
+        use tauri::{PhysicalPosition, PhysicalSize};
+
+        window
+            .set_size(PhysicalSize::new(width, height))
+            .map_err(|error| format!("failed to resize pin window: {error}"))?;
+        window
+            .set_position(PhysicalPosition::new(x, y))
+            .map_err(|error| format!("failed to reposition pin window: {error}"))
+    }
+}
+
+pub fn close_pin<R: Runtime>(app: &AppHandle<R>, label: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        if !app.state::<PinStore>().contains(label)? {
+            return Err(format!("pinned capture does not exist: {label}"));
+        }
+        native::close(label)
+    }
+
+    #[cfg(not(windows))]
+    {
+        let window = pin_window(app, label)?;
+        window
+            .close()
+            .map_err(|error| format!("failed to close pin window: {error}"))?;
+        app.state::<PinStore>().remove(label)
+    }
 }
 
 #[cfg(windows)]
@@ -268,6 +438,23 @@ mod tests {
     use image::{GenericImageView, RgbaImage};
 
     use super::PinStore;
+
+    #[test]
+    fn converts_target_inner_extent_to_the_native_outer_extent() {
+        assert_eq!(super::target_outer_extent(376, 376, 378).unwrap(), 378);
+        assert_eq!(super::target_outer_extent(250, 250, 252).unwrap(), 252);
+        assert_eq!(super::target_outer_extent(100, 101, 100).unwrap(), 100);
+        assert!(super::target_outer_extent(u32::MAX, 1, 2).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn keeps_native_zoomed_windows_reachable_inside_the_work_area() {
+        assert_eq!(super::clamp_native_axis(-50, 500, 0, 1920, 64), 0);
+        assert_eq!(super::clamp_native_axis(1600, 500, 0, 1920, 64), 1420);
+        assert_eq!(super::clamp_native_axis(-3000, 2400, 0, 1920, 64), -2336);
+        assert_eq!(super::clamp_native_axis(3000, 2400, 0, 1920, 64), 1856);
+    }
 
     #[test]
     fn stores_and_removes_pinned_images() {
