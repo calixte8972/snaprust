@@ -29,6 +29,7 @@ import {
   rotateSelectedCapture,
   saveTranslationConfig,
   setCaptureAnnotations,
+  setCaptureFrame,
   setHistoryFavorite,
   setHistoryFavoriteBatch,
   setHistoryTags,
@@ -37,6 +38,7 @@ import {
   type AnnotationPoint,
   type AnnotationRect,
   type CapturePayload,
+  type FrameStyle,
   type HistoryItemPayload,
   type OcrLinePayload,
   type SelectionCropRect,
@@ -97,6 +99,7 @@ const historyBatchUnfavorite = requireElement<HTMLButtonElement>("#history-batch
 const historyBatchExport = requireElement<HTMLButtonElement>("#history-batch-export");
 const historyBatchDelete = requireElement<HTMLButtonElement>("#history-batch-delete");
 const annotationCanvasWrap = requireElement("#annotation-canvas-wrap");
+const annotationFrame = requireElement("#annotation-frame");
 const annotationCanvas = requireElement<HTMLCanvasElement>("#annotation-canvas");
 const annotationTextEditor = requireElement("#annotation-text-editor");
 const annotationTextInput = requireElement<HTMLTextAreaElement>("#annotation-text-input");
@@ -114,6 +117,7 @@ const annotationZoomFit = requireElement<HTMLButtonElement>("#annotation-zoom-fi
 const annotationCropActions = requireElement("#annotation-crop-actions");
 const annotationCropCancel = requireElement<HTMLButtonElement>("#annotation-crop-cancel");
 const annotationCropApply = requireElement<HTMLButtonElement>("#annotation-crop-apply");
+const annotationFrameToggle = requireElement<HTMLButtonElement>("#annotation-frame-toggle");
 const annotationUndo = requireElement<HTMLButtonElement>("#annotation-undo");
 const annotationRedo = requireElement<HTMLButtonElement>("#annotation-redo");
 const annotationClear = requireElement<HTMLButtonElement>("#annotation-clear");
@@ -158,6 +162,7 @@ let pinInProgress = false;
 let ocrInProgress = false;
 let translationInProgress = false;
 let cropInProgress = false;
+let frameInProgress = false;
 let nextTranslationRequestId = 0;
 let activeTranslationRequestId: number | null = null;
 let ocrLanguagesLoaded = false;
@@ -170,6 +175,7 @@ let settingsInProgress = false;
 let settingsRequestVersion = 0;
 let rotationQuarters = 0;
 let currentCapture: CapturePayload | null = null;
+let annotationFrameStyle: FrameStyle = "none";
 type AnnotationTool = "arrow" | "rectangle" | "ellipse" | "brush" | "mosaic" | "text" | "crop";
 let annotationTool: AnnotationTool = "arrow";
 let selectedImage: HTMLImageElement | null = null;
@@ -315,6 +321,7 @@ function resetSelectionUi(): void {
   ocrInProgress = false;
   translationInProgress = false;
   cropInProgress = false;
+  frameInProgress = false;
   annotationCanvas.style.width = "";
   annotationCanvas.style.height = "";
   annotationCanvas.style.maxWidth = "";
@@ -329,6 +336,8 @@ function resetSelectionUi(): void {
   annotationEditor.hidden = true;
   annotationEditor.style.removeProperty("--annotation-editor-width");
   annotationEditor.style.removeProperty("--annotation-editor-height");
+  annotationFrameStyle = "none";
+  updateAnnotationFramePreview();
   historyPanel.hidden = true;
   overlay.dataset.state = "idle";
   annotations = [];
@@ -344,6 +353,7 @@ function resetSelectionUi(): void {
   annotationUndo.disabled = true;
   annotationRedo.disabled = true;
   annotationClear.disabled = true;
+  annotationFrameToggle.disabled = false;
   annotationPin.disabled = false;
   annotationOcr.disabled = false;
   ocrPanel.hidden = true;
@@ -688,6 +698,107 @@ function currentAnnotationWidth(): number {
   return Number(annotationWidth.value);
 }
 
+type MacosFrameMetrics = Readonly<{
+  side: number;
+  top: number;
+  bottom: number;
+  dotRadius: number;
+  dotFirstX: number;
+  dotStep: number;
+}>;
+
+function macosFrameMetrics(imageWidth: number, imageHeight: number): MacosFrameMetrics {
+  const area = Math.max(1, imageWidth) * Math.max(1, imageHeight);
+  const scale = Math.max(0.75, Math.min(2, Math.sqrt(area / (1280 * 720))));
+  const scaled = (value: number): number => Math.max(1, Math.round(value * scale));
+  return {
+    side: scaled(12),
+    top: scaled(38),
+    bottom: scaled(12),
+    dotRadius: scaled(6),
+    dotFirstX: scaled(20),
+    dotStep: scaled(16),
+  };
+}
+
+function annotationFrameInsets(
+  imageWidth = annotationCanvas.width,
+  imageHeight = annotationCanvas.height,
+): { width: number; height: number } {
+  if (annotationFrameStyle !== "macos") return { width: 0, height: 0 };
+  const metrics = macosFrameMetrics(imageWidth, imageHeight);
+  return {
+    width: metrics.side * 2,
+    height: metrics.top + metrics.bottom,
+  };
+}
+
+function updateAnnotationFrameDisplayScale(displayScale: number): void {
+  const metrics = macosFrameMetrics(annotationCanvas.width, annotationCanvas.height);
+  const px = (value: number): string => `${Math.max(1, value * displayScale)}px`;
+  annotationFrame.style.setProperty("--annotation-frame-side", px(metrics.side));
+  annotationFrame.style.setProperty("--annotation-frame-top", px(metrics.top));
+  annotationFrame.style.setProperty("--annotation-frame-bottom", px(metrics.bottom));
+  annotationFrame.style.setProperty("--annotation-frame-dot-size", px(metrics.dotRadius * 2));
+  annotationFrame.style.setProperty(
+    "--annotation-frame-dot-left",
+    px(metrics.dotFirstX - metrics.dotRadius),
+  );
+  annotationFrame.style.setProperty(
+    "--annotation-frame-dot-gap",
+    px(Math.max(1, metrics.dotStep - metrics.dotRadius * 2)),
+  );
+}
+
+function updateAnnotationFramePreview(): void {
+  const active = annotationFrameStyle === "macos";
+  annotationFrame.dataset.style = annotationFrameStyle;
+  annotationFrameToggle.classList.toggle("is-active", active);
+  annotationFrameToggle.setAttribute("aria-pressed", String(active));
+  annotationFrameToggle.title = active
+    ? "移除 macOS 风格窗口边框"
+    : "添加 macOS 风格窗口边框";
+  updateAnnotationFrameDisplayScale(
+    Math.max(0.05, annotationZoomBaseScale * annotationZoomFactor),
+  );
+}
+
+async function setAnnotationFrameStyle(style: FrameStyle): Promise<void> {
+  if (
+    !selectedCapture
+    || cropInProgress
+    || frameInProgress
+    || ocrInProgress
+    || translationInProgress
+    || copyInProgress
+    || pinInProgress
+    || annotationTool === "crop"
+    || style === annotationFrameStyle
+  ) return;
+
+  frameInProgress = true;
+  annotationFrameToggle.disabled = true;
+  const version = captureSessionVersion;
+  try {
+    await setCaptureFrame(style);
+    if (version !== captureSessionVersion || annotationEditor.hidden) return;
+    annotationFrameStyle = style;
+    updateAnnotationFramePreview();
+    updateAnnotationEditorLayout();
+    scheduleAnnotationCanvasFit();
+    annotationStatus.textContent = style === "macos"
+      ? "已添加 macOS 风格边框；复制或钉图时会一起输出"
+      : "已移除图片边框";
+  } catch (error) {
+    annotationStatus.textContent = `边框设置失败：${String(error)}`;
+  } finally {
+    if (version === captureSessionVersion) {
+      frameInProgress = false;
+      annotationFrameToggle.disabled = false;
+    }
+  }
+}
+
 function setAnnotationTool(tool: AnnotationTool): void {
   if (tool !== "text") cancelTextEditor();
   if (tool !== "crop") {
@@ -914,6 +1025,7 @@ function updateAnnotationStatus(): void {
 }
 
 function updateAnnotationEditorLayout(imageWidth = annotationCanvas.width, imageHeight = annotationCanvas.height): void {
+  const frame = annotationFrameInsets(imageWidth, imageHeight);
   const availableWidth = Math.max(320, window.innerWidth - 32);
   const ocrWidth = ocrPanel.hidden
     ? 0
@@ -921,10 +1033,10 @@ function updateAnnotationEditorLayout(imageWidth = annotationCanvas.width, image
   const editorWidth = Math.min(
     1180,
     availableWidth,
-    Math.max(640, imageWidth + 36 + ocrWidth),
+    Math.max(640, imageWidth + 36 + frame.width + ocrWidth),
   );
   const editorHeight = Math.min(
-    Math.max(ocrPanel.hidden ? 260 : 480, imageHeight + 130),
+    Math.max(ocrPanel.hidden ? 260 : 480, imageHeight + 130 + frame.height),
     Math.max(240, window.innerHeight - 32),
   );
   annotationEditor.style.setProperty("--annotation-editor-width", `${editorWidth}px`);
@@ -938,16 +1050,18 @@ function applyAnnotationZoom(): void {
   annotationCanvas.style.height = `${Math.max(1, Math.round(annotationCanvas.height * scale))}px`;
   annotationCanvas.style.maxWidth = "none";
   annotationCanvas.style.maxHeight = "none";
+  updateAnnotationFrameDisplayScale(scale);
 }
 
 function fitAnnotationCanvas(): void {
   if (!selectedImage || annotationCanvas.width <= 0 || annotationCanvas.height <= 0) return;
+  const frame = annotationFrameInsets();
   const availableWidth = Math.max(1, annotationCanvasWrap.clientWidth - 36);
   const availableHeight = Math.max(1, annotationCanvasWrap.clientHeight - 36);
   annotationZoomBaseScale = Math.min(
     1,
-    availableWidth / annotationCanvas.width,
-    availableHeight / annotationCanvas.height,
+    availableWidth / (annotationCanvas.width + frame.width),
+    availableHeight / (annotationCanvas.height + frame.height),
   );
   if (!Number.isFinite(annotationZoomBaseScale) || annotationZoomBaseScale <= 0) {
     annotationZoomBaseScale = 1;
@@ -1002,10 +1116,15 @@ function setHighlightedOcrLine(line: OcrLinePayload | null): void {
 
 function scrollOcrLineIntoView(line: OcrLinePayload): void {
   const canvasBounds = annotationCanvas.getBoundingClientRect();
+  const wrapBounds = annotationCanvasWrap.getBoundingClientRect();
   if (canvasBounds.width <= 0 || canvasBounds.height <= 0) return;
   const scale = canvasBounds.width / annotationCanvas.width;
-  const targetLeft = annotationCanvas.offsetLeft + (line.rect.x + line.rect.width / 2) * scale;
-  const targetTop = annotationCanvas.offsetTop + (line.rect.y + line.rect.height / 2) * scale;
+  const targetLeft =
+    canvasBounds.left - wrapBounds.left + annotationCanvasWrap.scrollLeft
+    + (line.rect.x + line.rect.width / 2) * scale;
+  const targetTop =
+    canvasBounds.top - wrapBounds.top + annotationCanvasWrap.scrollTop
+    + (line.rect.y + line.rect.height / 2) * scale;
   annotationCanvasWrap.scrollTo({
     left: Math.max(0, targetLeft - annotationCanvasWrap.clientWidth / 2),
     top: Math.max(0, targetTop - annotationCanvasWrap.clientHeight / 2),
@@ -1120,6 +1239,8 @@ async function openAnnotationEditor(selected: SelectionPayload): Promise<Readonl
   committedAnnotationCanvas.height = selected.height;
   rotationQuarters = 0;
   annotationCanvas.style.transform = "";
+  annotationFrameStyle = "none";
+  updateAnnotationFramePreview();
   annotations = [];
   annotationRedoStack = [];
   updateAnnotationEditorLayout(selected.width, selected.height);
@@ -1169,6 +1290,7 @@ async function applyCropSelection(): Promise<void> {
     !selectedCapture
     || !cropDraft
     || cropInProgress
+    || frameInProgress
     || ocrInProgress
     || translationInProgress
     || copyInProgress
@@ -1216,6 +1338,8 @@ async function applyCropSelection(): Promise<void> {
     committedAnnotationCanvas.height = cropped.height;
     rotationQuarters = 0;
     annotationCanvas.style.transform = "";
+    annotationFrameStyle = "none";
+    updateAnnotationFramePreview();
     annotations = [];
     annotationRedoStack = [];
     cropStart = null;
@@ -1580,7 +1704,7 @@ async function commitSelection(selection: SelectionRect): Promise<void> {
 
 async function copySelection(): Promise<void> {
   commitTextEditor();
-  if (!selectedCapture || copyInProgress || pinInProgress || ocrInProgress) {
+  if (!selectedCapture || copyInProgress || pinInProgress || ocrInProgress || frameInProgress) {
     return;
   }
 
@@ -1620,7 +1744,7 @@ async function copySelection(): Promise<void> {
 }
 
 async function pinSelection(): Promise<void> {
-  if (!selectedCapture || pinInProgress || copyInProgress || ocrInProgress) {
+  if (!selectedCapture || pinInProgress || copyInProgress || ocrInProgress || frameInProgress) {
     return;
   }
 
@@ -1661,7 +1785,14 @@ async function pinSelection(): Promise<void> {
 }
 
 async function recognizeSelection(): Promise<boolean> {
-  if (!selectedCapture || ocrInProgress || copyInProgress || pinInProgress || translationInProgress) return false;
+  if (
+    !selectedCapture
+    || ocrInProgress
+    || copyInProgress
+    || pinInProgress
+    || translationInProgress
+    || frameInProgress
+  ) return false;
 
   ocrInProgress = true;
   const version = captureSessionVersion;
@@ -2034,6 +2165,10 @@ imageContextMenu.querySelectorAll<HTMLButtonElement>("[data-image-action]").forE
 
 annotationWidth.addEventListener("input", () => {
   annotationWidthValue.textContent = `${annotationWidth.value} px`;
+});
+
+annotationFrameToggle.addEventListener("click", () => {
+  void setAnnotationFrameStyle(annotationFrameStyle === "macos" ? "none" : "macos");
 });
 
 annotationUndo.addEventListener("click", () => {

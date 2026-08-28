@@ -37,6 +37,7 @@ fn main() {
             commands::crop_selected_capture,
             commands::get_selected_capture_image,
             commands::set_capture_annotations,
+            commands::set_capture_frame,
             commands::rotate_selected_capture,
             commands::recognize_selected_capture,
             commands::list_ocr_languages,

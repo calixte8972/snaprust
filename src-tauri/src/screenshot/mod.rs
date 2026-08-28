@@ -8,9 +8,9 @@ pub(crate) use self::monitor::VirtualDesktop;
 use std::{sync::Mutex, time::Instant};
 
 use image::{
-    ImageEncoder, RgbaImage,
+    ImageEncoder, Rgba, RgbaImage,
     codecs::png::{CompressionType, FilterType, PngEncoder},
-    imageops::{crop_imm, rotate90, rotate180, rotate270},
+    imageops::{crop_imm, overlay, rotate90, rotate180, rotate270},
 };
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
@@ -29,6 +29,7 @@ pub struct CapturedScreen {
 #[derive(Default)]
 pub struct CaptureSession {
     current: Mutex<Option<CapturedScreen>>,
+    frame_style: Mutex<FrameStyle>,
 }
 
 #[derive(Serialize)]
@@ -56,6 +57,14 @@ pub struct SelectionCropRect {
     y: u32,
     width: u32,
     height: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum FrameStyle {
+    #[default]
+    None,
+    Macos,
 }
 
 #[derive(Serialize)]
@@ -94,20 +103,32 @@ struct PixelRect {
 
 impl CaptureSession {
     fn replace(&self, capture: CapturedScreen) -> Result<(), String> {
-        let mut current = self
-            .current
+        {
+            let mut current = self
+                .current
+                .lock()
+                .map_err(|_| "capture session lock is poisoned".to_owned())?;
+            *current = Some(capture);
+        }
+        *self
+            .frame_style
             .lock()
-            .map_err(|_| "capture session lock is poisoned".to_owned())?;
-        *current = Some(capture);
+            .map_err(|_| "capture frame lock is poisoned".to_owned())? = FrameStyle::None;
         Ok(())
     }
 
     fn clear(&self) -> Result<(), String> {
-        let mut current = self
-            .current
+        {
+            let mut current = self
+                .current
+                .lock()
+                .map_err(|_| "capture session lock is poisoned".to_owned())?;
+            *current = None;
+        }
+        *self
+            .frame_style
             .lock()
-            .map_err(|_| "capture session lock is poisoned".to_owned())?;
-        *current = None;
+            .map_err(|_| "capture frame lock is poisoned".to_owned())? = FrameStyle::None;
         Ok(())
     }
 
@@ -180,6 +201,10 @@ impl CaptureSession {
         capture.image = None;
         capture.annotations.clear();
         capture.rotation_quarters = 0;
+        *self
+            .frame_style
+            .lock()
+            .map_err(|_| "capture frame lock is poisoned".to_owned())? = FrameStyle::None;
         Ok(payload)
     }
 
@@ -220,7 +245,31 @@ impl CaptureSession {
         capture.selection = Some(cropped);
         capture.annotations.clear();
         capture.rotation_quarters = 0;
+        *self
+            .frame_style
+            .lock()
+            .map_err(|_| "capture frame lock is poisoned".to_owned())? = FrameStyle::None;
         Ok(payload)
+    }
+
+    pub fn set_frame_style(&self, style: FrameStyle) -> Result<(), String> {
+        let current = self
+            .current
+            .lock()
+            .map_err(|_| "capture session lock is poisoned".to_owned())?;
+        let capture = current
+            .as_ref()
+            .ok_or_else(|| "there is no active screen capture".to_owned())?;
+        if capture.selection.is_none() {
+            return Err("select an area before adding an image frame".to_owned());
+        }
+        drop(current);
+
+        *self
+            .frame_style
+            .lock()
+            .map_err(|_| "capture frame lock is poisoned".to_owned())? = style;
+        Ok(())
     }
 
     pub fn rotate_selection(&self, delta_quarters: i32) -> Result<RotationPayload, String> {
@@ -290,7 +339,7 @@ impl CaptureSession {
     }
 
     pub(crate) fn rendered_selection(&self) -> Result<RgbaImage, String> {
-        let (mut selection, annotations, rotation_quarters) = {
+        let (mut selection, annotations, rotation_quarters, frame_style) = {
             let current = self
                 .current
                 .lock()
@@ -302,10 +351,15 @@ impl CaptureSession {
                 .selection
                 .as_ref()
                 .ok_or_else(|| "select an area before copying".to_owned())?;
+            let frame_style = *self
+                .frame_style
+                .lock()
+                .map_err(|_| "capture frame lock is poisoned".to_owned())?;
             (
                 selection.clone(),
                 capture.annotations.clone(),
                 capture.rotation_quarters,
+                frame_style,
             )
         };
 
@@ -317,7 +371,7 @@ impl CaptureSession {
             3 => rotate270(&selection),
             _ => unreachable!("rotation is normalized to four quarters"),
         };
-        Ok(selection)
+        apply_frame(selection, frame_style)
     }
 
     /// Returns the untouched selected pixels for OCR. Annotations are excluded
@@ -336,6 +390,133 @@ impl CaptureSession {
             .clone()
             .ok_or_else(|| "select an area before recognizing text".to_owned())
     }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct MacosFrameMetrics {
+    side: u32,
+    top: u32,
+    bottom: u32,
+    dot_radius: u32,
+    dot_first_x: u32,
+    dot_step: u32,
+    dot_y: u32,
+}
+
+fn macos_frame_metrics(image_width: u32, image_height: u32) -> MacosFrameMetrics {
+    let area = f64::from(image_width.max(1)) * f64::from(image_height.max(1));
+    let scale = (area / (1280.0 * 720.0)).sqrt().clamp(0.75, 2.0);
+    let scaled = |value: f64| (value * scale).round().max(1.0) as u32;
+    MacosFrameMetrics {
+        side: scaled(12.0),
+        top: scaled(38.0),
+        bottom: scaled(12.0),
+        dot_radius: scaled(6.0),
+        dot_first_x: scaled(20.0),
+        dot_step: scaled(16.0),
+        dot_y: scaled(19.0),
+    }
+}
+
+fn apply_frame(image: RgbaImage, style: FrameStyle) -> Result<RgbaImage, String> {
+    match style {
+        FrameStyle::None => Ok(image),
+        FrameStyle::Macos => apply_macos_frame(image),
+    }
+}
+
+fn apply_macos_frame(image: RgbaImage) -> Result<RgbaImage, String> {
+    let metrics = macos_frame_metrics(image.width(), image.height());
+    let window_width = image
+        .width()
+        .checked_add(metrics.side * 2)
+        .ok_or_else(|| "macOS frame would make the image too wide".to_owned())?;
+    let window_height = image
+        .height()
+        .checked_add(metrics.top + metrics.bottom)
+        .ok_or_else(|| "macOS frame would make the image too tall".to_owned())?;
+    let mut framed = RgbaImage::from_pixel(window_width, window_height, Rgba([27, 28, 31, 255]));
+    fill_macos_header(&mut framed, metrics.top);
+
+    overlay(
+        &mut framed,
+        &image,
+        i64::from(metrics.side),
+        i64::from(metrics.top),
+    );
+    let separator_y = metrics.top.saturating_sub(1);
+    for x in 0..window_width {
+        blend_opaque_pixel(&mut framed, x, separator_y, Rgba([12, 13, 15, 180]), 1.0);
+    }
+    for (index, color) in [
+        Rgba([255, 95, 86, 255]),
+        Rgba([255, 189, 46, 255]),
+        Rgba([39, 201, 63, 255]),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        draw_antialiased_circle(
+            &mut framed,
+            f64::from(metrics.dot_first_x + metrics.dot_step * index as u32),
+            f64::from(metrics.dot_y),
+            f64::from(metrics.dot_radius),
+            color,
+        );
+    }
+
+    Ok(framed)
+}
+
+fn fill_macos_header(image: &mut RgbaImage, height: u32) {
+    let height = height.min(image.height());
+    for y in 0..height {
+        let progress = f64::from(y) / f64::from(height.max(1));
+        let value = (43.0 - progress * 8.0).round() as u8;
+        let color = Rgba([value, value, value.saturating_add(3), 255]);
+        for x in 0..image.width() {
+            *image.get_pixel_mut(x, y) = color;
+        }
+    }
+}
+
+fn draw_antialiased_circle(
+    image: &mut RgbaImage,
+    center_x: f64,
+    center_y: f64,
+    radius: f64,
+    color: Rgba<u8>,
+) {
+    let left = (center_x - radius - 1.0).floor().max(0.0) as u32;
+    let right = (center_x + radius + 1.0)
+        .ceil()
+        .min(f64::from(image.width())) as u32;
+    let top = (center_y - radius - 1.0).floor().max(0.0) as u32;
+    let bottom = (center_y + radius + 1.0)
+        .ceil()
+        .min(f64::from(image.height())) as u32;
+    for y in top..bottom {
+        for x in left..right {
+            let distance = (f64::from(x) + 0.5 - center_x).hypot(f64::from(y) + 0.5 - center_y);
+            let coverage = (radius + 0.5 - distance).clamp(0.0, 1.0);
+            if coverage > 0.0 {
+                blend_opaque_pixel(image, x, y, color, coverage);
+            }
+        }
+    }
+}
+
+fn blend_opaque_pixel(image: &mut RgbaImage, x: u32, y: u32, color: Rgba<u8>, coverage: f64) {
+    if x >= image.width() || y >= image.height() {
+        return;
+    }
+    let alpha = f64::from(color.0[3]) / 255.0 * coverage.clamp(0.0, 1.0);
+    let pixel = image.get_pixel_mut(x, y);
+    for (destination, source) in pixel.0[..3].iter_mut().zip(color.0[..3].iter()) {
+        *destination =
+            (f64::from(*source) * alpha + f64::from(*destination) * (1.0 - alpha)).round() as u8;
+    }
+    pixel.0[3] = 255;
 }
 
 pub(crate) fn encode_png(image: &RgbaImage) -> Result<Vec<u8>, String> {
@@ -499,8 +680,8 @@ mod tests {
     use image::{GenericImageView, Rgba, RgbaImage, imageops::crop_imm};
 
     use super::{
-        CaptureSession, CapturedScreen, PhysicalSelectionRect, SelectionCropRect, VirtualDesktop,
-        monitor::MonitorInfo,
+        CaptureSession, CapturedScreen, FrameStyle, PhysicalSelectionRect, SelectionCropRect,
+        VirtualDesktop, monitor::MonitorInfo,
     };
 
     fn desktop(x: i32, y: i32, width: u32, height: u32) -> VirtualDesktop {
@@ -736,6 +917,55 @@ mod tests {
         assert_eq!(rendered.dimensions(), (1, 2));
         assert_eq!(rendered.get_pixel(0, 0).0, [255, 0, 0, 255]);
         assert_eq!(rendered.get_pixel(0, 1).0, [0, 0, 255, 255]);
+    }
+
+    #[test]
+    fn macos_frame_wraps_output_and_keeps_selected_pixels_intact() {
+        let session = CaptureSession::default();
+        session
+            .replace(CapturedScreen {
+                desktop: desktop(0, 0, 2, 1),
+                image: None,
+                selection: Some(
+                    RgbaImage::from_raw(
+                        2,
+                        1,
+                        vec![
+                            255, 0, 0, 255, // red, left
+                            0, 0, 255, 255, // blue, right
+                        ],
+                    )
+                    .unwrap(),
+                ),
+                annotations: Vec::new(),
+                rotation_quarters: 0,
+                capture_ms: 0.0,
+            })
+            .unwrap();
+
+        session.set_frame_style(FrameStyle::Macos).unwrap();
+        let rendered = session.rendered_selection().unwrap();
+        let metrics = super::macos_frame_metrics(2, 1);
+        let content_x = metrics.side;
+        let content_y = metrics.top;
+        assert_eq!(
+            rendered.dimensions(),
+            (2 + metrics.side * 2, 1 + metrics.top + metrics.bottom)
+        );
+        assert_eq!(rendered.get_pixel(content_x, content_y).0, [255, 0, 0, 255]);
+        assert_eq!(
+            rendered.get_pixel(content_x + 1, content_y).0,
+            [0, 0, 255, 255]
+        );
+        assert_eq!(
+            rendered.get_pixel(metrics.dot_first_x, metrics.dot_y).0,
+            [255, 95, 86, 255]
+        );
+        assert_eq!(
+            rendered.get_pixel(0, rendered.height() - 1).0,
+            [27, 28, 31, 255]
+        );
+        assert!(rendered.pixels().all(|pixel| pixel.0[3] == 255));
     }
 
     #[test]

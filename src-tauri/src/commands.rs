@@ -3,8 +3,8 @@ use tauri::{AppHandle, Manager, Runtime, State};
 use crate::{
     annotation::Annotation,
     screenshot::{
-        CapturePayload, CaptureSession, CopyPayload, PhysicalSelectionRect, SelectionCropRect,
-        SelectionPayload,
+        CapturePayload, CaptureSession, CopyPayload, FrameStyle, PhysicalSelectionRect,
+        SelectionCropRect, SelectionPayload,
     },
 };
 
@@ -75,6 +75,14 @@ pub fn set_capture_annotations(
     session: State<'_, CaptureSession>,
 ) -> Result<(), String> {
     session.set_annotations(annotations)
+}
+
+#[tauri::command]
+pub fn set_capture_frame(
+    style: FrameStyle,
+    session: State<'_, CaptureSession>,
+) -> Result<(), String> {
+    session.set_frame_style(style)
 }
 
 #[tauri::command]

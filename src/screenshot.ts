@@ -44,6 +44,8 @@ export type RotationPayload = Readonly<{
   height: number;
 }>;
 
+export type FrameStyle = "none" | "macos";
+
 export type CopyPayload = Readonly<{
   width: number;
   height: number;
@@ -202,6 +204,10 @@ export async function getSelectedCaptureImage(): Promise<ArrayBuffer> {
 
 export async function setCaptureAnnotations(annotations: ReadonlyArray<Annotation>): Promise<void> {
   await invoke("set_capture_annotations", { annotations });
+}
+
+export async function setCaptureFrame(style: FrameStyle): Promise<void> {
+  await invoke("set_capture_frame", { style });
 }
 
 export async function rotateSelectedCapture(deltaQuarters: number): Promise<RotationPayload> {

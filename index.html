@@ -81,6 +81,8 @@
           <button type="button" data-tool="text" class="annotation-tool" title="文字">T</button>
           <button type="button" data-tool="crop" class="annotation-tool" title="裁剪图片">✂</button>
           <span class="annotation-toolbar__separator"></span>
+          <button id="annotation-frame-toggle" type="button" class="annotation-action" title="添加 macOS 风格窗口边框" aria-pressed="false">▣ macOS</button>
+          <span class="annotation-toolbar__separator"></span>
           <label class="annotation-color" title="颜色"><input id="annotation-color" type="color" value="#43d9a3" /></label>
           <label class="annotation-width" title="粗细"><input id="annotation-width" type="range" min="1" max="32" value="4" /></label>
           <span id="annotation-width-value" class="annotation-width-value">4 px</span>
@@ -91,7 +93,14 @@
         </div>
         <div class="annotation-workspace">
           <div id="annotation-canvas-wrap" class="annotation-canvas-wrap">
-            <canvas id="annotation-canvas" aria-label="截图标注画布"></canvas>
+            <div id="annotation-frame" class="annotation-frame" data-style="none">
+              <div class="annotation-frame__chrome" aria-hidden="true">
+                <span class="annotation-frame__dot annotation-frame__dot--close"></span>
+                <span class="annotation-frame__dot annotation-frame__dot--minimize"></span>
+                <span class="annotation-frame__dot annotation-frame__dot--maximize"></span>
+              </div>
+              <canvas id="annotation-canvas" aria-label="截图标注画布"></canvas>
+            </div>
             <div id="annotation-text-editor" class="annotation-text-editor" hidden>
               <textarea id="annotation-text-input" maxlength="512" rows="3" placeholder="输入文字；Ctrl+Enter 确认" aria-label="文字标注内容"></textarea>
               <div class="annotation-text-editor__actions">
