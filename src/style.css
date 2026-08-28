@@ -909,11 +909,70 @@ body {
   white-space: nowrap;
 }
 
-#annotation-frame-toggle.is-active {
+.annotation-frame-picker {
+  position: relative;
+  display: flex;
+  height: 34px;
+  align-items: center;
+  gap: 6px;
+  padding: 0 24px 0 9px;
+  border: 1px solid rgb(255 255 255 / 16%);
+  border-radius: 8px;
+  background: linear-gradient(180deg, rgb(255 255 255 / 7%), rgb(255 255 255 / 3%));
+  color: rgb(247 247 245 / 78%);
+  transition: border-color 120ms ease, background 120ms ease, box-shadow 120ms ease;
+}
+
+.annotation-frame-picker::after {
+  content: "";
+  position: absolute;
+  right: 9px;
+  width: 6px;
+  height: 6px;
+  border-right: 1.5px solid currentcolor;
+  border-bottom: 1.5px solid currentcolor;
+  pointer-events: none;
+  transform: translateY(-2px) rotate(45deg);
+}
+
+.annotation-frame-picker:hover,
+.annotation-frame-picker:focus-within {
   border-color: rgb(67 217 163 / 55%);
-  background: linear-gradient(180deg, rgb(67 217 163 / 19%), rgb(67 217 163 / 10%));
+  background: rgb(67 217 163 / 12%);
   color: #a7f5d5;
-  box-shadow: inset 0 0 0 1px rgb(138 240 201 / 10%);
+  box-shadow: inset 0 0 0 1px rgb(138 240 201 / 8%);
+}
+
+.annotation-frame-picker:focus-within {
+  outline: 2px solid rgb(67 217 163 / 24%);
+  outline-offset: 1px;
+}
+
+.annotation-frame-picker__icon {
+  color: #78e8bd;
+  font-size: 14px;
+  line-height: 1;
+}
+
+.annotation-frame-picker select {
+  min-width: 88px;
+  border: 0;
+  appearance: none;
+  background: transparent;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  outline: 0;
+}
+
+.annotation-frame-picker select:disabled {
+  cursor: wait;
+  opacity: 0.45;
+}
+
+.annotation-frame-picker option {
+  background: #17212b;
+  color: #f7f7f5;
 }
 
 .annotation-color {
@@ -1001,7 +1060,13 @@ body {
   display: contents;
 }
 
-.annotation-frame[data-style="macos"] {
+.annotation-frame[data-style="none"] .annotation-frame__chrome {
+  display: none;
+}
+
+.annotation-frame[data-style="macos"],
+.annotation-frame[data-style="windows11"],
+.annotation-frame[data-style="polaroid"] {
   --annotation-frame-side: 12px;
   --annotation-frame-top: 38px;
   --annotation-frame-bottom: 12px;
@@ -1017,8 +1082,19 @@ body {
   overflow: hidden;
   padding: var(--annotation-frame-top) var(--annotation-frame-side)
     var(--annotation-frame-bottom);
-  background: #1b1c1f;
   box-shadow: none;
+}
+
+.annotation-frame[data-style="macos"] {
+  background: #1b1c1f;
+}
+
+.annotation-frame[data-style="windows11"] {
+  background: #e7e7e7;
+}
+
+.annotation-frame[data-style="polaroid"] {
+  background: linear-gradient(135deg, #fbfaf7 0%, #f2efe8 100%);
 }
 
 .annotation-frame__chrome {
@@ -1027,14 +1103,35 @@ body {
   top: 0;
   right: 0;
   left: 0;
-  display: flex;
+  display: none;
   align-items: center;
-  gap: var(--annotation-frame-dot-gap, 4px);
   height: var(--annotation-frame-top, 38px);
-  padding-left: var(--annotation-frame-dot-left, 14px);
   border-bottom: 1px solid rgb(0 0 0 / 58%);
   border-radius: 0;
+}
+
+.annotation-frame[data-style="macos"] .annotation-frame__chrome {
+  display: flex;
+  padding-left: var(--annotation-frame-dot-left, 14px);
   background: linear-gradient(180deg, #2b2b2e 0%, #232326 100%);
+}
+
+.annotation-frame[data-style="windows11"] .annotation-frame__chrome {
+  display: flex;
+  padding-left: var(--annotation-frame-windows-icon-left, 14px);
+  border-bottom-color: rgb(0 0 0 / 14%);
+  background: linear-gradient(180deg, #f7f7f7 0%, #ededed 100%);
+  color: #2b2b2b;
+}
+
+.annotation-frame__traffic-lights {
+  display: none;
+  align-items: center;
+  gap: var(--annotation-frame-dot-gap, 4px);
+}
+
+.annotation-frame[data-style="macos"] .annotation-frame__traffic-lights {
+  display: flex;
 }
 
 .annotation-frame__dot {
@@ -1057,18 +1154,97 @@ body {
   background: #28c840;
 }
 
-.annotation-frame__title {
+.annotation-frame__windows-logo,
+.annotation-frame__windows-title,
+.annotation-frame__windows-controls {
   display: none;
 }
 
-.annotation-frame[data-style="macos"] canvas {
+.annotation-frame[data-style="windows11"] .annotation-frame__windows-logo {
+  display: grid;
+  width: var(--annotation-frame-windows-icon, 12px);
+  height: var(--annotation-frame-windows-icon, 12px);
+  flex: 0 0 auto;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: 1fr 1fr;
+  gap: max(1px, var(--annotation-frame-windows-stroke, 1px));
+}
+
+.annotation-frame__windows-logo i {
+  background: #1777d2;
+}
+
+.annotation-frame[data-style="windows11"] .annotation-frame__windows-title {
+  display: block;
+  overflow: hidden;
+  margin-left: 8px;
+  color: #3a3a3a;
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.annotation-frame[data-style="windows11"] .annotation-frame__windows-controls {
+  display: flex;
+  height: 100%;
+  margin-left: auto;
+}
+
+.annotation-frame__windows-controls > i {
+  position: relative;
+  display: block;
+  width: var(--annotation-frame-windows-control, 46px);
+  height: 100%;
+  flex: 0 0 auto;
+}
+
+.annotation-frame__windows-minimize::before,
+.annotation-frame__windows-maximize::before,
+.annotation-frame__windows-close::before,
+.annotation-frame__windows-close::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 10px;
+  height: var(--annotation-frame-windows-stroke, 1px);
+  background: #3a3a3a;
+  transform: translate(-50%, -50%);
+}
+
+.annotation-frame__windows-minimize::before {
+  transform: translate(-50%, 4px);
+}
+
+.annotation-frame__windows-maximize::before {
+  width: 9px;
+  height: 7px;
+  border: var(--annotation-frame-windows-stroke, 1px) solid #3a3a3a;
+  background: transparent;
+}
+
+.annotation-frame__windows-close::before {
+  transform: translate(-50%, -50%) rotate(45deg);
+}
+
+.annotation-frame__windows-close::after {
+  transform: translate(-50%, -50%) rotate(-45deg);
+}
+
+.annotation-frame[data-style="macos"] canvas,
+.annotation-frame[data-style="windows11"] canvas,
+.annotation-frame[data-style="polaroid"] canvas {
   position: relative;
   z-index: 1;
   max-width: none;
   max-height: none;
   border-radius: 0;
   outline: 0;
-  box-shadow: 0 1px 0 rgb(255 255 255 / 8%);
+  box-shadow: none;
+}
+
+.annotation-frame[data-style="polaroid"] canvas {
+  box-shadow: 0 0 0 1px rgb(61 55 47 / 14%);
 }
 
 .ocr-panel {

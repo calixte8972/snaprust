@@ -44,7 +44,14 @@ export type RotationPayload = Readonly<{
   height: number;
 }>;
 
-export type FrameStyle = "none" | "macos";
+export type ScrollCapturePayload = Readonly<{
+  width: number;
+  height: number;
+  segments: number;
+  durationMs: number;
+}>;
+
+export type FrameStyle = "none" | "macos" | "windows11" | "polaroid";
 
 export type CopyPayload = Readonly<{
   width: number;
@@ -196,6 +203,10 @@ export async function selectCaptureRegion(
 
 export async function cropSelectedCapture(crop: SelectionCropRect): Promise<SelectionPayload> {
   return invoke<SelectionPayload>("crop_selected_capture", { crop });
+}
+
+export async function captureScrollingSelection(): Promise<ScrollCapturePayload> {
+  return invoke<ScrollCapturePayload>("capture_scrolling_selection");
 }
 
 export async function getSelectedCaptureImage(): Promise<ArrayBuffer> {

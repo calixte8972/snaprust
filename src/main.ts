@@ -3,6 +3,7 @@ import { listen } from "@tauri-apps/api/event";
 import {
   cancelCapture,
   cancelTranslation,
+  captureScrollingSelection,
   copyHistoryCapture,
   copyText,
   copySelectedCapture,
@@ -117,10 +118,11 @@ const annotationZoomFit = requireElement<HTMLButtonElement>("#annotation-zoom-fi
 const annotationCropActions = requireElement("#annotation-crop-actions");
 const annotationCropCancel = requireElement<HTMLButtonElement>("#annotation-crop-cancel");
 const annotationCropApply = requireElement<HTMLButtonElement>("#annotation-crop-apply");
-const annotationFrameToggle = requireElement<HTMLButtonElement>("#annotation-frame-toggle");
+const annotationFrameSelect = requireElement<HTMLSelectElement>("#annotation-frame-select");
 const annotationUndo = requireElement<HTMLButtonElement>("#annotation-undo");
 const annotationRedo = requireElement<HTMLButtonElement>("#annotation-redo");
 const annotationClear = requireElement<HTMLButtonElement>("#annotation-clear");
+const annotationScrollCapture = requireElement<HTMLButtonElement>("#annotation-scroll-capture");
 const annotationOcr = requireElement<HTMLButtonElement>("#annotation-ocr");
 const annotationTranslate = requireElement<HTMLButtonElement>("#annotation-translate");
 const annotationPin = requireElement<HTMLButtonElement>("#annotation-pin");
@@ -163,6 +165,7 @@ let ocrInProgress = false;
 let translationInProgress = false;
 let cropInProgress = false;
 let frameInProgress = false;
+let scrollCaptureInProgress = false;
 let nextTranslationRequestId = 0;
 let activeTranslationRequestId: number | null = null;
 let ocrLanguagesLoaded = false;
@@ -322,6 +325,7 @@ function resetSelectionUi(): void {
   translationInProgress = false;
   cropInProgress = false;
   frameInProgress = false;
+  scrollCaptureInProgress = false;
   annotationCanvas.style.width = "";
   annotationCanvas.style.height = "";
   annotationCanvas.style.maxWidth = "";
@@ -353,7 +357,8 @@ function resetSelectionUi(): void {
   annotationUndo.disabled = true;
   annotationRedo.disabled = true;
   annotationClear.disabled = true;
-  annotationFrameToggle.disabled = false;
+  annotationFrameSelect.disabled = false;
+  annotationScrollCapture.disabled = false;
   annotationPin.disabled = false;
   annotationOcr.disabled = false;
   ocrPanel.hidden = true;
@@ -698,19 +703,26 @@ function currentAnnotationWidth(): number {
   return Number(annotationWidth.value);
 }
 
-type MacosFrameMetrics = Readonly<{
+type FrameMetrics = Readonly<{
   side: number;
   top: number;
   bottom: number;
+}>;
+
+type MacosFrameMetrics = FrameMetrics & Readonly<{
   dotRadius: number;
   dotFirstX: number;
   dotStep: number;
 }>;
 
-function macosFrameMetrics(imageWidth: number, imageHeight: number): MacosFrameMetrics {
+function frameMetricScaler(imageWidth: number, imageHeight: number): (value: number) => number {
   const area = Math.max(1, imageWidth) * Math.max(1, imageHeight);
   const scale = Math.max(0.75, Math.min(2, Math.sqrt(area / (1280 * 720))));
-  const scaled = (value: number): number => Math.max(1, Math.round(value * scale));
+  return (value: number): number => Math.max(1, Math.round(value * scale));
+}
+
+function macosFrameMetrics(imageWidth: number, imageHeight: number): MacosFrameMetrics {
+  const scaled = frameMetricScaler(imageWidth, imageHeight);
   return {
     side: scaled(12),
     top: scaled(38),
@@ -721,12 +733,29 @@ function macosFrameMetrics(imageWidth: number, imageHeight: number): MacosFrameM
   };
 }
 
+function annotationFrameMetrics(
+  style: FrameStyle,
+  imageWidth: number,
+  imageHeight: number,
+): FrameMetrics {
+  const scaled = frameMetricScaler(imageWidth, imageHeight);
+  switch (style) {
+    case "macos":
+      return macosFrameMetrics(imageWidth, imageHeight);
+    case "windows11":
+      return { side: scaled(8), top: scaled(40), bottom: scaled(8) };
+    case "polaroid":
+      return { side: scaled(24), top: scaled(24), bottom: scaled(72) };
+    case "none":
+      return { side: 0, top: 0, bottom: 0 };
+  }
+}
+
 function annotationFrameInsets(
   imageWidth = annotationCanvas.width,
   imageHeight = annotationCanvas.height,
 ): { width: number; height: number } {
-  if (annotationFrameStyle !== "macos") return { width: 0, height: 0 };
-  const metrics = macosFrameMetrics(imageWidth, imageHeight);
+  const metrics = annotationFrameMetrics(annotationFrameStyle, imageWidth, imageHeight);
   return {
     width: metrics.side * 2,
     height: metrics.top + metrics.bottom,
@@ -734,30 +763,35 @@ function annotationFrameInsets(
 }
 
 function updateAnnotationFrameDisplayScale(displayScale: number): void {
-  const metrics = macosFrameMetrics(annotationCanvas.width, annotationCanvas.height);
+  const metrics = annotationFrameMetrics(
+    annotationFrameStyle,
+    annotationCanvas.width,
+    annotationCanvas.height,
+  );
+  const macosMetrics = macosFrameMetrics(annotationCanvas.width, annotationCanvas.height);
+  const scaled = frameMetricScaler(annotationCanvas.width, annotationCanvas.height);
   const px = (value: number): string => `${Math.max(1, value * displayScale)}px`;
   annotationFrame.style.setProperty("--annotation-frame-side", px(metrics.side));
   annotationFrame.style.setProperty("--annotation-frame-top", px(metrics.top));
   annotationFrame.style.setProperty("--annotation-frame-bottom", px(metrics.bottom));
-  annotationFrame.style.setProperty("--annotation-frame-dot-size", px(metrics.dotRadius * 2));
+  annotationFrame.style.setProperty("--annotation-frame-dot-size", px(macosMetrics.dotRadius * 2));
   annotationFrame.style.setProperty(
     "--annotation-frame-dot-left",
-    px(metrics.dotFirstX - metrics.dotRadius),
+    px(macosMetrics.dotFirstX - macosMetrics.dotRadius),
   );
   annotationFrame.style.setProperty(
     "--annotation-frame-dot-gap",
-    px(Math.max(1, metrics.dotStep - metrics.dotRadius * 2)),
+    px(Math.max(1, macosMetrics.dotStep - macosMetrics.dotRadius * 2)),
   );
+  annotationFrame.style.setProperty("--annotation-frame-windows-icon", px(scaled(12)));
+  annotationFrame.style.setProperty("--annotation-frame-windows-icon-left", px(scaled(14)));
+  annotationFrame.style.setProperty("--annotation-frame-windows-control", px(scaled(46)));
+  annotationFrame.style.setProperty("--annotation-frame-windows-stroke", px(scaled(1)));
 }
 
 function updateAnnotationFramePreview(): void {
-  const active = annotationFrameStyle === "macos";
   annotationFrame.dataset.style = annotationFrameStyle;
-  annotationFrameToggle.classList.toggle("is-active", active);
-  annotationFrameToggle.setAttribute("aria-pressed", String(active));
-  annotationFrameToggle.title = active
-    ? "移除 macOS 风格窗口边框"
-    : "添加 macOS 风格窗口边框";
+  annotationFrameSelect.value = annotationFrameStyle;
   updateAnnotationFrameDisplayScale(
     Math.max(0.05, annotationZoomBaseScale * annotationZoomFactor),
   );
@@ -772,12 +806,13 @@ async function setAnnotationFrameStyle(style: FrameStyle): Promise<void> {
     || translationInProgress
     || copyInProgress
     || pinInProgress
+    || scrollCaptureInProgress
     || annotationTool === "crop"
     || style === annotationFrameStyle
   ) return;
 
   frameInProgress = true;
-  annotationFrameToggle.disabled = true;
+  annotationFrameSelect.disabled = true;
   const version = captureSessionVersion;
   try {
     await setCaptureFrame(style);
@@ -786,15 +821,17 @@ async function setAnnotationFrameStyle(style: FrameStyle): Promise<void> {
     updateAnnotationFramePreview();
     updateAnnotationEditorLayout();
     scheduleAnnotationCanvasFit();
-    annotationStatus.textContent = style === "macos"
-      ? "已添加 macOS 风格边框；复制或钉图时会一起输出"
-      : "已移除图片边框";
+    const label = annotationFrameSelect.selectedOptions[0]?.textContent ?? style;
+    annotationStatus.textContent = style === "none"
+      ? "已移除图片边框"
+      : `已应用${label}边框；复制或钉图时会一起输出`;
   } catch (error) {
+    annotationFrameSelect.value = annotationFrameStyle;
     annotationStatus.textContent = `边框设置失败：${String(error)}`;
   } finally {
     if (version === captureSessionVersion) {
       frameInProgress = false;
-      annotationFrameToggle.disabled = false;
+      annotationFrameSelect.disabled = false;
     }
   }
 }
@@ -1295,6 +1332,7 @@ async function applyCropSelection(): Promise<void> {
     || translationInProgress
     || copyInProgress
     || pinInProgress
+    || scrollCaptureInProgress
   ) return;
 
   const crop = cropRectForBackend(cropDraft);
@@ -1307,6 +1345,7 @@ async function applyCropSelection(): Promise<void> {
   annotationOcr.disabled = true;
   annotationTranslate.disabled = true;
   annotationPin.disabled = true;
+  annotationScrollCapture.disabled = true;
   annotationStatus.textContent = "正在应用裁剪…";
   const version = captureSessionVersion;
 
@@ -1360,6 +1399,77 @@ async function applyCropSelection(): Promise<void> {
     annotationOcr.disabled = false;
     annotationTranslate.disabled = false;
     annotationPin.disabled = false;
+    annotationScrollCapture.disabled = false;
+  }
+}
+
+async function captureLongScreenshot(): Promise<void> {
+  commitTextEditor();
+  if (
+    !selectedCapture
+    || scrollCaptureInProgress
+    || cropInProgress
+    || frameInProgress
+    || ocrInProgress
+    || translationInProgress
+    || copyInProgress
+    || pinInProgress
+  ) return;
+
+  if (
+    (annotations.length > 0 || rotationQuarters !== 0 || annotationFrameStyle !== "none")
+    && !window.confirm("长截图会清除当前标注、旋转和图片边框，是否继续？")
+  ) return;
+
+  scrollCaptureInProgress = true;
+  annotationScrollCapture.disabled = true;
+  annotationOcr.disabled = true;
+  annotationTranslate.disabled = true;
+  annotationPin.disabled = true;
+  annotationFrameSelect.disabled = true;
+  annotationStatus.textContent = "正在隐藏编辑器并自动滚动拼接，请暂时不要操作目标窗口…";
+  const version = captureSessionVersion;
+  let overlayHidden = false;
+
+  try {
+    overlayHidden = true;
+    const result = await captureScrollingSelection();
+    if (version !== captureSessionVersion) return;
+    selectedCapture = {
+      width: result.width,
+      height: result.height,
+      cropMs: 0,
+    };
+    const editorPerformance = await openAnnotationEditor(selectedCapture);
+    if (!editorPerformance || version !== captureSessionVersion) return;
+    clearOcrResultsAfterCrop();
+    await revealCaptureOverlay();
+    overlayHidden = false;
+    annotationStatus.textContent = `长截图完成：${result.segments} 段 · ${result.width}×${result.height} · ${formatMilliseconds(result.durationMs)}`;
+    reportPerformance("scroll-capture", {
+      captureAndStitch: result.durationMs,
+      selectedPngIpc: editorPerformance.pngIpcMs,
+      browserDecode: editorPerformance.decodeMs,
+    });
+  } catch (error) {
+    annotationStatus.textContent = `长截图失败：${String(error)}`;
+    console.error("failed to capture scrolling selection", error);
+  } finally {
+    if (overlayHidden && version === captureSessionVersion) {
+      try {
+        await revealCaptureOverlay();
+      } catch (error) {
+        console.error("failed to restore capture overlay after scrolling capture", error);
+      }
+    }
+    if (version === captureSessionVersion) {
+      scrollCaptureInProgress = false;
+      annotationScrollCapture.disabled = false;
+      annotationOcr.disabled = false;
+      annotationTranslate.disabled = false;
+      annotationPin.disabled = false;
+      annotationFrameSelect.disabled = false;
+    }
   }
 }
 
@@ -1568,7 +1678,16 @@ function showImageContextMenu(clientX: number, clientY: number): void {
 }
 
 async function rotateSelectedImage(deltaQuarters: number): Promise<void> {
-  if (!selectedCapture) return;
+  if (
+    !selectedCapture
+    || scrollCaptureInProgress
+    || cropInProgress
+    || frameInProgress
+    || ocrInProgress
+    || translationInProgress
+    || copyInProgress
+    || pinInProgress
+  ) return;
   try {
     const rotation = await rotateSelectedCapture(deltaQuarters);
     rotationQuarters = rotation.quarters;
@@ -1599,7 +1718,7 @@ async function handleImageContextAction(action: string): Promise<void> {
       await translateSelection();
       break;
     case "crop":
-      if (!cropInProgress && !ocrInProgress && !translationInProgress && !copyInProgress && !pinInProgress) {
+      if (!scrollCaptureInProgress && !cropInProgress && !ocrInProgress && !translationInProgress && !copyInProgress && !pinInProgress) {
         setAnnotationTool("crop");
       }
       break;
@@ -1704,7 +1823,7 @@ async function commitSelection(selection: SelectionRect): Promise<void> {
 
 async function copySelection(): Promise<void> {
   commitTextEditor();
-  if (!selectedCapture || copyInProgress || pinInProgress || ocrInProgress || frameInProgress) {
+  if (!selectedCapture || copyInProgress || pinInProgress || ocrInProgress || frameInProgress || scrollCaptureInProgress) {
     return;
   }
 
@@ -1712,6 +1831,7 @@ async function copySelection(): Promise<void> {
   annotationPin.disabled = true;
   annotationOcr.disabled = true;
   annotationTranslate.disabled = true;
+  annotationScrollCapture.disabled = true;
   const totalStarted = performance.now();
   let annotationSyncMs = 0;
   if (!annotationEditor.hidden) annotationStatus.textContent = "正在由 Rust 合成并复制…";
@@ -1740,11 +1860,12 @@ async function copySelection(): Promise<void> {
     annotationPin.disabled = false;
     annotationOcr.disabled = false;
     annotationTranslate.disabled = false;
+    annotationScrollCapture.disabled = false;
   }
 }
 
 async function pinSelection(): Promise<void> {
-  if (!selectedCapture || pinInProgress || copyInProgress || ocrInProgress || frameInProgress) {
+  if (!selectedCapture || pinInProgress || copyInProgress || ocrInProgress || frameInProgress || scrollCaptureInProgress) {
     return;
   }
 
@@ -1752,6 +1873,7 @@ async function pinSelection(): Promise<void> {
   annotationPin.disabled = true;
   annotationOcr.disabled = true;
   annotationTranslate.disabled = true;
+  annotationScrollCapture.disabled = true;
   const totalStarted = performance.now();
   let annotationSyncMs = 0;
   annotationStatus.textContent = "正在由 Rust 合成并创建置顶窗口…";
@@ -1781,6 +1903,7 @@ async function pinSelection(): Promise<void> {
     annotationPin.disabled = false;
     annotationOcr.disabled = false;
     annotationTranslate.disabled = false;
+    annotationScrollCapture.disabled = false;
   }
 }
 
@@ -1792,6 +1915,7 @@ async function recognizeSelection(): Promise<boolean> {
     || pinInProgress
     || translationInProgress
     || frameInProgress
+    || scrollCaptureInProgress
   ) return false;
 
   ocrInProgress = true;
@@ -1799,6 +1923,7 @@ async function recognizeSelection(): Promise<boolean> {
   annotationOcr.disabled = true;
   annotationPin.disabled = true;
   annotationTranslate.disabled = true;
+  annotationScrollCapture.disabled = true;
   ocrPanel.hidden = false;
   updateAnnotationEditorLayout();
   scheduleAnnotationCanvasFit();
@@ -1841,6 +1966,7 @@ async function recognizeSelection(): Promise<boolean> {
       annotationOcr.disabled = false;
       annotationPin.disabled = false;
       annotationTranslate.disabled = false;
+      annotationScrollCapture.disabled = false;
       ocrLanguage.disabled = !ocrLanguagesLoaded || ocrLanguage.options.length <= 1;
     }
   }
@@ -1867,7 +1993,7 @@ async function copyOcrResult(): Promise<void> {
 }
 
 async function translateSelection(): Promise<void> {
-  if (!selectedCapture || translationInProgress || copyInProgress || pinInProgress) return;
+  if (!selectedCapture || translationInProgress || copyInProgress || pinInProgress || scrollCaptureInProgress) return;
 
   commitTextEditor();
   annotationTranslate.disabled = true;
@@ -1891,6 +2017,7 @@ async function translateSelection(): Promise<void> {
   annotationOcr.disabled = true;
   annotationPin.disabled = true;
   annotationStatus.textContent = "正在翻译 OCR 文字…";
+  annotationScrollCapture.disabled = true;
   const version = captureSessionVersion;
   const requestId = ++nextTranslationRequestId;
   activeTranslationRequestId = requestId;
@@ -1924,6 +2051,7 @@ async function translateSelection(): Promise<void> {
       annotationTranslate.disabled = false;
       annotationOcr.disabled = false;
       annotationPin.disabled = false;
+      annotationScrollCapture.disabled = false;
     }
   }
 }
@@ -2167,8 +2295,8 @@ annotationWidth.addEventListener("input", () => {
   annotationWidthValue.textContent = `${annotationWidth.value} px`;
 });
 
-annotationFrameToggle.addEventListener("click", () => {
-  void setAnnotationFrameStyle(annotationFrameStyle === "macos" ? "none" : "macos");
+annotationFrameSelect.addEventListener("change", () => {
+  void setAnnotationFrameStyle(annotationFrameSelect.value as FrameStyle);
 });
 
 annotationUndo.addEventListener("click", () => {
@@ -2194,6 +2322,8 @@ annotationClear.addEventListener("click", () => {
 
 annotationCropCancel.addEventListener("click", () => setAnnotationTool("arrow"));
 annotationCropApply.addEventListener("click", () => void applyCropSelection());
+
+annotationScrollCapture.addEventListener("click", () => void captureLongScreenshot());
 
 annotationPin.addEventListener("click", () => {
   commitTextEditor();

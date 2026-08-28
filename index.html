@@ -81,7 +81,15 @@
           <button type="button" data-tool="text" class="annotation-tool" title="文字">T</button>
           <button type="button" data-tool="crop" class="annotation-tool" title="裁剪图片">✂</button>
           <span class="annotation-toolbar__separator"></span>
-          <button id="annotation-frame-toggle" type="button" class="annotation-action" title="添加 macOS 风格窗口边框" aria-pressed="false">▣ macOS</button>
+          <label class="annotation-frame-picker" title="选择导出图片边框">
+            <span class="annotation-frame-picker__icon" aria-hidden="true">▣</span>
+            <select id="annotation-frame-select" aria-label="图片边框样式">
+              <option value="none">无边框</option>
+              <option value="macos">macOS</option>
+              <option value="windows11">Windows 11</option>
+              <option value="polaroid">拍立得</option>
+            </select>
+          </label>
           <span class="annotation-toolbar__separator"></span>
           <label class="annotation-color" title="颜色"><input id="annotation-color" type="color" value="#43d9a3" /></label>
           <label class="annotation-width" title="粗细"><input id="annotation-width" type="range" min="1" max="32" value="4" /></label>
@@ -95,9 +103,18 @@
           <div id="annotation-canvas-wrap" class="annotation-canvas-wrap">
             <div id="annotation-frame" class="annotation-frame" data-style="none">
               <div class="annotation-frame__chrome" aria-hidden="true">
-                <span class="annotation-frame__dot annotation-frame__dot--close"></span>
-                <span class="annotation-frame__dot annotation-frame__dot--minimize"></span>
-                <span class="annotation-frame__dot annotation-frame__dot--maximize"></span>
+                <span class="annotation-frame__traffic-lights">
+                  <span class="annotation-frame__dot annotation-frame__dot--close"></span>
+                  <span class="annotation-frame__dot annotation-frame__dot--minimize"></span>
+                  <span class="annotation-frame__dot annotation-frame__dot--maximize"></span>
+                </span>
+                <span class="annotation-frame__windows-logo"><i></i><i></i><i></i><i></i></span>
+                <span class="annotation-frame__windows-title">SnapRust</span>
+                <span class="annotation-frame__windows-controls">
+                  <i class="annotation-frame__windows-minimize"></i>
+                  <i class="annotation-frame__windows-maximize"></i>
+                  <i class="annotation-frame__windows-close"></i>
+                </span>
               </div>
               <canvas id="annotation-canvas" aria-label="截图标注画布"></canvas>
             </div>
@@ -181,6 +198,7 @@
           </div>
           <span class="annotation-editor__hints"><kbd>Ctrl+C</kbd> 复制图片 · <kbd>Esc</kbd> 取消</span>
           <div class="annotation-editor__actions">
+            <button id="annotation-scroll-capture" type="button" class="annotation-action" title="自动滚动并拼接当前选区">⇣ 长截图</button>
             <button id="annotation-ocr" type="button" class="annotation-action" title="识别选区中的文字">OCR</button>
             <button id="annotation-translate" type="button" class="annotation-action" title="识别并翻译选区中的文字">翻译</button>
             <button id="annotation-pin" type="button" class="annotation-action annotation-action--primary" title="钉到桌面">📌 钉图</button>

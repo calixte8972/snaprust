@@ -35,6 +35,7 @@ fn main() {
             commands::get_current_capture_image,
             commands::select_capture_region,
             commands::crop_selected_capture,
+            commands::capture_scrolling_selection,
             commands::get_selected_capture_image,
             commands::set_capture_annotations,
             commands::set_capture_frame,

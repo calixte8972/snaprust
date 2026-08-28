@@ -59,6 +59,13 @@ pub fn crop_selected_capture(
 }
 
 #[tauri::command]
+pub async fn capture_scrolling_selection<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<crate::screenshot::ScrollCapturePayload, String> {
+    crate::screenshot::capture_scrolling(app).await
+}
+
+#[tauri::command]
 pub async fn get_selected_capture_image<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<tauri::ipc::Response, String> {

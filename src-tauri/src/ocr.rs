@@ -2,8 +2,13 @@
 
 use std::time::Instant;
 
-use image::{RgbaImage, imageops::FilterType};
+use image::{Rgba, RgbaImage, imageops::FilterType};
 use serde::Serialize;
+
+const OCR_TARGET_LARGEST_DIMENSION: u32 = 1_600;
+const OCR_TARGET_SMALLEST_DIMENSION: u32 = 480;
+const OCR_MAX_UPSCALE: f64 = 2.0;
+const OCR_PADDING: u32 = 16;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -41,6 +46,19 @@ pub struct OcrLinePayload {
 struct ImageExtent {
     width: u32,
     height: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct OcrImageTransform {
+    content_x: u32,
+    content_y: u32,
+    content_extent: ImageExtent,
+    source_extent: ImageExtent,
+}
+
+struct PreparedOcrImage {
+    image: RgbaImage,
+    transform: OcrImageTransform,
 }
 
 #[derive(Debug, Serialize)]
@@ -173,11 +191,11 @@ pub fn recognize(image: RgbaImage, language_tag: Option<String>) -> Result<OcrPa
     let source_height = image.height();
     let maximum_dimension = OcrEngine::MaxImageDimension()
         .map_err(|error| format!("failed to query the Windows OCR image limit: {error}"))?;
-    let image = fit_for_ocr(image, maximum_dimension);
-    let recognition_width = image.width();
-    let recognition_height = image.height();
+    let prepared = prepare_for_ocr(image, maximum_dimension)?;
+    let recognition_width = prepared.image.width();
+    let recognition_height = prepared.image.height();
 
-    let png = crate::screenshot::encode_png(&image)?;
+    let png = crate::screenshot::encode_png(&prepared.image)?;
     let stream = InMemoryRandomAccessStream::new()
         .map_err(|error| format!("failed to create the OCR image stream: {error}"))?;
     let writer = DataWriter::CreateDataWriter(&stream)
@@ -221,17 +239,7 @@ pub fn recognize(image: RgbaImage, language_tag: Option<String>) -> Result<OcrPa
         .Text()
         .map_err(|error| format!("failed to read the OCR result: {error}"))?
         .to_string();
-    let lines = extract_lines(
-        &result,
-        ImageExtent {
-            width: recognition_width,
-            height: recognition_height,
-        },
-        ImageExtent {
-            width: source_width,
-            height: source_height,
-        },
-    )?;
+    let lines = extract_lines(&result, prepared.transform)?;
     let line_count = lines.len();
 
     Ok(OcrPayload {
@@ -283,8 +291,7 @@ fn create_engine(language_tag: Option<&str>) -> Result<windows::Media::Ocr::OcrE
 #[cfg(windows)]
 fn extract_lines(
     result: &windows::Media::Ocr::OcrResult,
-    recognition_extent: ImageExtent,
-    source_extent: ImageExtent,
+    transform: OcrImageTransform,
 ) -> Result<Vec<OcrLinePayload>, String> {
     let lines = result
         .Lines()
@@ -333,14 +340,9 @@ fn extract_lines(
             bottom = bottom.max(rect.Y + rect.Height);
         }
 
-        let Some(rect) = map_recognition_rect_to_source(
-            left,
-            top,
-            right - left,
-            bottom - top,
-            recognition_extent,
-            source_extent,
-        ) else {
+        let Some(rect) =
+            map_recognition_rect_to_source(left, top, right - left, bottom - top, transform)
+        else {
             continue;
         };
         payload.push(OcrLinePayload {
@@ -357,8 +359,7 @@ fn map_recognition_rect_to_source(
     y: f32,
     width: f32,
     height: f32,
-    recognition_extent: ImageExtent,
-    source_extent: ImageExtent,
+    transform: OcrImageTransform,
 ) -> Option<OcrRectPayload> {
     if !x.is_finite()
         || !y.is_finite()
@@ -366,26 +367,40 @@ fn map_recognition_rect_to_source(
         || !height.is_finite()
         || width <= 0.0
         || height <= 0.0
-        || recognition_extent.width == 0
-        || recognition_extent.height == 0
-        || source_extent.width == 0
-        || source_extent.height == 0
+        || transform.content_extent.width == 0
+        || transform.content_extent.height == 0
+        || transform.source_extent.width == 0
+        || transform.source_extent.height == 0
     {
         return None;
     }
 
-    let scale_x = source_extent.width as f32 / recognition_extent.width as f32;
-    let scale_y = source_extent.height as f32 / recognition_extent.height as f32;
-    let left = (x * scale_x).floor().clamp(0.0, source_extent.width as f32) as u32;
-    let top = (y * scale_y)
+    let content_x = transform.content_x as f32;
+    let content_y = transform.content_y as f32;
+    let content_right = content_x + transform.content_extent.width as f32;
+    let content_bottom = content_y + transform.content_extent.height as f32;
+    let recognition_left = x.max(content_x).min(content_right);
+    let recognition_top = y.max(content_y).min(content_bottom);
+    let recognition_right = (x + width).max(content_x).min(content_right);
+    let recognition_bottom = (y + height).max(content_y).min(content_bottom);
+    if recognition_right <= recognition_left || recognition_bottom <= recognition_top {
+        return None;
+    }
+
+    let scale_x = transform.source_extent.width as f32 / transform.content_extent.width as f32;
+    let scale_y = transform.source_extent.height as f32 / transform.content_extent.height as f32;
+    let left = ((recognition_left - content_x) * scale_x)
         .floor()
-        .clamp(0.0, source_extent.height as f32) as u32;
-    let right = ((x + width) * scale_x)
+        .clamp(0.0, transform.source_extent.width as f32) as u32;
+    let top = ((recognition_top - content_y) * scale_y)
+        .floor()
+        .clamp(0.0, transform.source_extent.height as f32) as u32;
+    let right = ((recognition_right - content_x) * scale_x)
         .ceil()
-        .clamp(0.0, source_extent.width as f32) as u32;
-    let bottom = ((y + height) * scale_y)
+        .clamp(0.0, transform.source_extent.width as f32) as u32;
+    let bottom = ((recognition_bottom - content_y) * scale_y)
         .ceil()
-        .clamp(0.0, source_extent.height as f32) as u32;
+        .clamp(0.0, transform.source_extent.height as f32) as u32;
     (right > left && bottom > top).then_some(OcrRectPayload {
         x: left,
         y: top,
@@ -394,36 +409,171 @@ fn map_recognition_rect_to_source(
     })
 }
 
-fn fit_for_ocr(image: RgbaImage, maximum_dimension: u32) -> RgbaImage {
-    let largest = image.width().max(image.height());
-    if largest <= maximum_dimension || maximum_dimension == 0 {
-        return image;
+fn prepare_for_ocr(
+    mut image: RgbaImage,
+    maximum_dimension: u32,
+) -> Result<PreparedOcrImage, String> {
+    let source_extent = ImageExtent {
+        width: image.width(),
+        height: image.height(),
+    };
+    if source_extent.width == 0 || source_extent.height == 0 {
+        return Err("cannot recognize an empty image".to_owned());
     }
 
-    let scale = f64::from(maximum_dimension) / f64::from(largest);
-    let width = (f64::from(image.width()) * scale).round().max(1.0) as u32;
-    let height = (f64::from(image.height()) * scale).round().max(1.0) as u32;
-    image::imageops::resize(&image, width, height, FilterType::Lanczos3)
+    flatten_transparency(&mut image);
+    let largest = source_extent.width.max(source_extent.height);
+    let smallest = source_extent.width.min(source_extent.height);
+    let padding = if maximum_dimension == 0 {
+        OCR_PADDING
+    } else {
+        OCR_PADDING.min(maximum_dimension.saturating_sub(1) / 2)
+    };
+    let maximum_content_dimension = if maximum_dimension == 0 {
+        u32::MAX
+    } else {
+        maximum_dimension.saturating_sub(padding * 2).max(1)
+    };
+    let largest_dimension_scale = f64::from(OCR_TARGET_LARGEST_DIMENSION) / f64::from(largest);
+    let smallest_dimension_scale = f64::from(OCR_TARGET_SMALLEST_DIMENSION) / f64::from(smallest);
+    let desired_scale = largest_dimension_scale
+        .max(smallest_dimension_scale)
+        .clamp(1.0, OCR_MAX_UPSCALE);
+    let maximum_scale = f64::from(maximum_content_dimension) / f64::from(largest);
+    let scale = desired_scale.min(maximum_scale);
+    let content_width = (f64::from(source_extent.width) * scale).round().max(1.0) as u32;
+    let content_height = (f64::from(source_extent.height) * scale).round().max(1.0) as u32;
+    let mut content =
+        if content_width == source_extent.width && content_height == source_extent.height {
+            image
+        } else {
+            image::imageops::resize(&image, content_width, content_height, FilterType::Lanczos3)
+        };
+    if scale > 1.0 {
+        content = image::imageops::unsharpen(&content, 0.8, 1);
+    }
+
+    let background = edge_average_color(&content);
+    let recognition_width = content_width
+        .checked_add(padding * 2)
+        .ok_or_else(|| "OCR image padding would make the image too wide".to_owned())?;
+    let recognition_height = content_height
+        .checked_add(padding * 2)
+        .ok_or_else(|| "OCR image padding would make the image too tall".to_owned())?;
+    let mut prepared = RgbaImage::from_pixel(recognition_width, recognition_height, background);
+    image::imageops::overlay(
+        &mut prepared,
+        &content,
+        i64::from(padding),
+        i64::from(padding),
+    );
+
+    Ok(PreparedOcrImage {
+        image: prepared,
+        transform: OcrImageTransform {
+            content_x: padding,
+            content_y: padding,
+            content_extent: ImageExtent {
+                width: content_width,
+                height: content_height,
+            },
+            source_extent,
+        },
+    })
+}
+
+fn flatten_transparency(image: &mut RgbaImage) {
+    for pixel in image.pixels_mut() {
+        let alpha = u32::from(pixel.0[3]);
+        let inverse_alpha = 255 - alpha;
+        for channel in &mut pixel.0[..3] {
+            *channel = ((u32::from(*channel) * alpha + 255 * inverse_alpha + 127) / 255) as u8;
+        }
+        pixel.0[3] = 255;
+    }
+}
+
+fn edge_average_color(image: &RgbaImage) -> Rgba<u8> {
+    let mut sums = [0_u64; 3];
+    let mut count = 0_u64;
+    let mut sample = |pixel: &Rgba<u8>| {
+        for (sum, channel) in sums.iter_mut().zip(pixel.0[..3].iter()) {
+            *sum += u64::from(*channel);
+        }
+        count += 1;
+    };
+
+    for x in 0..image.width() {
+        sample(image.get_pixel(x, 0));
+        if image.height() > 1 {
+            sample(image.get_pixel(x, image.height() - 1));
+        }
+    }
+    for y in 1..image.height().saturating_sub(1) {
+        sample(image.get_pixel(0, y));
+        if image.width() > 1 {
+            sample(image.get_pixel(image.width() - 1, y));
+        }
+    }
+
+    Rgba([
+        (sums[0] / count.max(1)) as u8,
+        (sums[1] / count.max(1)) as u8,
+        (sums[2] / count.max(1)) as u8,
+        255,
+    ])
 }
 
 #[cfg(test)]
 mod tests {
     use image::{Rgba, RgbaImage};
 
-    use super::{ImageExtent, OcrRectPayload, fit_for_ocr, map_recognition_rect_to_source};
+    use super::{
+        ImageExtent, OCR_PADDING, OcrImageTransform, OcrRectPayload,
+        map_recognition_rect_to_source, prepare_for_ocr,
+    };
 
     #[test]
-    fn keeps_images_that_fit_the_ocr_limit() {
-        let image = RgbaImage::from_pixel(800, 600, Rgba([0, 0, 0, 255]));
-        let fitted = fit_for_ocr(image, 2_000);
-        assert_eq!(fitted.dimensions(), (800, 600));
+    fn upscales_small_images_and_adds_edge_padding() {
+        let image = RgbaImage::from_pixel(400, 200, Rgba([24, 32, 40, 255]));
+        let prepared = prepare_for_ocr(image, 2_600).unwrap();
+        assert_eq!(prepared.transform.content_extent.width, 800);
+        assert_eq!(prepared.transform.content_extent.height, 400);
+        assert_eq!(prepared.image.dimensions(), (832, 432));
+        assert_eq!(prepared.transform.content_x, OCR_PADDING);
+        assert_eq!(prepared.image.get_pixel(0, 0).0, [24, 32, 40, 255]);
     }
 
     #[test]
-    fn preserves_aspect_ratio_when_reducing_large_images() {
-        let image = RgbaImage::from_pixel(4_000, 2_000, Rgba([0, 0, 0, 255]));
-        let fitted = fit_for_ocr(image, 2_000);
-        assert_eq!(fitted.dimensions(), (2_000, 1_000));
+    fn enlarges_narrow_text_strips_up_to_the_windows_limit() {
+        let image = RgbaImage::from_pixel(800, 80, Rgba([255, 255, 255, 255]));
+        let prepared = prepare_for_ocr(image, 1_300).unwrap();
+        assert_eq!(prepared.transform.content_extent.width, 1_268);
+        assert_eq!(prepared.transform.content_extent.height, 127);
+        assert_eq!(prepared.image.dimensions(), (1_300, 159));
+    }
+
+    #[test]
+    fn preserves_aspect_ratio_and_padding_when_reducing_large_images() {
+        let image = RgbaImage::from_pixel(2_000, 1_000, Rgba([0, 0, 0, 255]));
+        let prepared = prepare_for_ocr(image, 1_000).unwrap();
+        assert_eq!(prepared.transform.content_extent.width, 968);
+        assert_eq!(prepared.transform.content_extent.height, 484);
+        assert_eq!(prepared.image.dimensions(), (1_000, 516));
+    }
+
+    #[test]
+    fn flattens_transparent_pixels_before_recognition() {
+        let image = RgbaImage::from_pixel(1, 1, Rgba([0, 0, 0, 0]));
+        let prepared = prepare_for_ocr(image, 2_600).unwrap();
+        assert_eq!(
+            prepared
+                .image
+                .get_pixel(prepared.transform.content_x, prepared.transform.content_y)
+                .0,
+            [255, 255, 255, 255]
+        );
+        assert!(prepared.image.pixels().all(|pixel| pixel.0[3] == 255));
     }
 
     #[test]
@@ -434,13 +584,17 @@ mod tests {
                 20.4,
                 30.1,
                 40.2,
-                ImageExtent {
-                    width: 100,
-                    height: 100,
-                },
-                ImageExtent {
-                    width: 200,
-                    height: 300,
+                OcrImageTransform {
+                    content_x: 0,
+                    content_y: 0,
+                    content_extent: ImageExtent {
+                        width: 100,
+                        height: 100,
+                    },
+                    source_extent: ImageExtent {
+                        width: 200,
+                        height: 300,
+                    },
                 },
             ),
             Some(OcrRectPayload {
@@ -453,20 +607,54 @@ mod tests {
     }
 
     #[test]
-    fn discards_ocr_rectangles_outside_or_without_visible_area() {
+    fn removes_padding_offset_when_mapping_ocr_rectangles() {
         assert_eq!(
             map_recognition_rect_to_source(
-                200.0,
-                10.0,
-                4.0,
-                10.0,
-                ImageExtent {
-                    width: 100,
-                    height: 100,
+                36.0,
+                26.0,
+                40.0,
+                20.0,
+                OcrImageTransform {
+                    content_x: 16,
+                    content_y: 16,
+                    content_extent: ImageExtent {
+                        width: 200,
+                        height: 100,
+                    },
+                    source_extent: ImageExtent {
+                        width: 100,
+                        height: 50,
+                    },
                 },
-                ImageExtent {
-                    width: 100,
-                    height: 100,
+            ),
+            Some(OcrRectPayload {
+                x: 10,
+                y: 5,
+                width: 20,
+                height: 10,
+            })
+        );
+    }
+
+    #[test]
+    fn discards_ocr_rectangles_outside_the_prepared_content() {
+        assert_eq!(
+            map_recognition_rect_to_source(
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+                OcrImageTransform {
+                    content_x: 16,
+                    content_y: 16,
+                    content_extent: ImageExtent {
+                        width: 100,
+                        height: 100,
+                    },
+                    source_extent: ImageExtent {
+                        width: 100,
+                        height: 100,
+                    },
                 },
             ),
             None

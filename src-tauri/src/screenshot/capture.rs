@@ -97,13 +97,25 @@ impl Drop for SelectedBitmap {
 }
 
 pub fn capture_virtual_desktop(desktop: &VirtualDesktop) -> Result<RgbaImage, String> {
-    let width = i32::try_from(desktop.width)
+    capture_screen_region(desktop.x, desktop.y, desktop.width, desktop.height)
+}
+
+pub fn capture_screen_region(
+    x: i32,
+    y: i32,
+    region_width: u32,
+    region_height: u32,
+) -> Result<RgbaImage, String> {
+    if region_width == 0 || region_height == 0 {
+        return Err("screen capture region must have a non-zero size".to_owned());
+    }
+    let width = i32::try_from(region_width)
         .map_err(|_| "virtual desktop width exceeds the Windows GDI limit".to_owned())?;
-    let height = i32::try_from(desktop.height)
+    let height = i32::try_from(region_height)
         .map_err(|_| "virtual desktop height exceeds the Windows GDI limit".to_owned())?;
-    let byte_len = usize::try_from(desktop.width)
+    let byte_len = usize::try_from(region_width)
         .ok()
-        .zip(usize::try_from(desktop.height).ok())
+        .zip(usize::try_from(region_height).ok())
         .and_then(|(width, height)| width.checked_mul(height))
         .and_then(|pixels| pixels.checked_mul(4))
         .ok_or_else(|| "screen capture buffer size overflowed".to_owned())?;
@@ -161,8 +173,8 @@ pub fn capture_virtual_desktop(desktop: &VirtualDesktop) -> Result<RgbaImage, St
             width,
             height,
             Some(screen_dc.0),
-            desktop.x,
-            desktop.y,
+            x,
+            y,
             SRCCOPY | CAPTUREBLT,
         )
     }
@@ -173,7 +185,7 @@ pub fn capture_virtual_desktop(desktop: &VirtualDesktop) -> Result<RgbaImage, St
     let mut rgba = unsafe { slice::from_raw_parts(bits.cast::<u8>(), byte_len) }.to_vec();
     bgra_to_rgba(&mut rgba);
 
-    RgbaImage::from_raw(desktop.width, desktop.height, rgba)
+    RgbaImage::from_raw(region_width, region_height, rgba)
         .ok_or_else(|| "failed to construct the captured image buffer".to_owned())
 }
 
