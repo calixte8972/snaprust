@@ -5,16 +5,17 @@
 //! adapter in this module, not changes to the screenshot or OCR pipeline.
 
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     env, fs,
     io::ErrorKind,
     path::PathBuf,
-    sync::Mutex,
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
 use serde::{Deserialize, Serialize};
 use tauri::{AppHandle, Manager, Runtime};
+use tokio::sync::Notify;
 
 const DEFAULT_PROVIDER: &str = "deepseek";
 const DEFAULT_MODEL: &str = "deepseek-v4-flash";
@@ -91,7 +92,8 @@ pub struct TranslationConfig {
 #[serde(rename_all = "camelCase")]
 struct StoredTranslationConfig {
     provider: String,
-    api_key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    api_key: Option<String>,
     endpoint: String,
     model: String,
 }
@@ -108,21 +110,24 @@ pub struct TranslationRequestStore {
 
 #[derive(Default)]
 struct TranslationRequestState {
-    active: HashSet<u64>,
+    active: HashMap<u64, Arc<Notify>>,
     cancelled: HashSet<u64>,
 }
 
+static TRANSLATION_CLIENT: OnceLock<Result<reqwest::Client, String>> = OnceLock::new();
+
 impl TranslationRequestStore {
-    pub fn begin(&self, request_id: u64) -> Result<(), String> {
+    pub fn begin(&self, request_id: u64) -> Result<Arc<Notify>, String> {
         if request_id == 0 {
             return Err("translation request id must be positive".to_owned());
         }
+        let notifier = Arc::new(Notify::new());
         self.state
             .lock()
             .map_err(|_| "translation request lock is poisoned".to_owned())?
             .active
-            .insert(request_id);
-        Ok(())
+            .insert(request_id, Arc::clone(&notifier));
+        Ok(notifier)
     }
 
     pub fn cancel(&self, request_id: u64) -> Result<(), String> {
@@ -133,8 +138,9 @@ impl TranslationRequestStore {
             .state
             .lock()
             .map_err(|_| "translation request lock is poisoned".to_owned())?;
-        if state.active.contains(&request_id) {
+        if let Some(notifier) = state.active.get(&request_id).cloned() {
             state.cancelled.insert(request_id);
+            notifier.notify_one();
         }
         Ok(())
     }
@@ -166,17 +172,26 @@ impl TranslationConfigStore {
         fs::create_dir_all(&app_data)
             .map_err(|error| format!("failed to create the SnapRust data directory: {error}"))?;
         let path = app_data.join(CONFIG_FILE_NAME);
+        recover_translation_config(&path)?;
         let config = match fs::read_to_string(&path) {
             Ok(contents) => {
                 let stored = serde_json::from_str::<StoredTranslationConfig>(&contents).map_err(
                     |error| format!("failed to read the translation configuration: {error}"),
                 )?;
-                TranslationConfig {
+                let legacy_api_key = stored.api_key.unwrap_or_default();
+                let secure_key = secure_api_key()?;
+                let should_migrate = secure_key.is_none() && !legacy_api_key.is_empty();
+                let config = TranslationConfig {
                     provider: normalize_provider(&stored.provider)?,
-                    api_key: stored.api_key,
+                    api_key: secure_key.unwrap_or(legacy_api_key),
                     endpoint: normalize_endpoint(&stored.endpoint)?,
                     model: normalize_model(&stored.model)?,
+                };
+                if should_migrate {
+                    store_secure_api_key(Some(&config.api_key))?;
+                    persist_translation_config(&path, &config)?;
                 }
+                config
             }
             Err(error) if error.kind() == ErrorKind::NotFound => {
                 TranslationConfig::from_environment()
@@ -227,33 +242,26 @@ impl TranslationConfigStore {
             .config
             .lock()
             .map_err(|_| "translation configuration lock is poisoned".to_owned())?;
-        config.provider = provider;
-        config.endpoint = endpoint;
-        config.model = model;
+        let mut next_config = config.clone();
+        next_config.provider = provider;
+        next_config.endpoint = endpoint;
+        next_config.model = model;
         if input.clear_api_key {
-            config.api_key.clear();
+            next_config.api_key.clear();
         } else if let Some(api_key) = input.api_key.filter(|value| !value.trim().is_empty()) {
-            config.api_key = api_key.trim().to_owned();
+            next_config.api_key = api_key.trim().to_owned();
         }
 
-        let stored = StoredTranslationConfig {
-            provider: config.provider.clone(),
-            api_key: config.api_key.clone(),
-            endpoint: config.endpoint.clone(),
-            model: config.model.clone(),
-        };
-        let serialized = serde_json::to_vec_pretty(&stored).map_err(|error| {
-            format!("failed to serialize the translation configuration: {error}")
-        })?;
-        let temporary_path = self.path.with_extension("json.tmp");
-        fs::write(&temporary_path, serialized)
-            .map_err(|error| format!("failed to write the translation configuration: {error}"))?;
-        if let Err(error) = fs::rename(&temporary_path, &self.path) {
-            let _ = fs::remove_file(&temporary_path);
-            return Err(format!(
-                "failed to finalize the translation configuration: {error}"
-            ));
+        store_secure_api_key(
+            (!next_config.api_key.is_empty()).then_some(next_config.api_key.as_str()),
+        )?;
+        if let Err(error) = persist_translation_config(&self.path, &next_config) {
+            let _ = store_secure_api_key(
+                (!config.api_key.is_empty()).then_some(config.api_key.as_str()),
+            );
+            return Err(error);
         }
+        *config = next_config;
         Ok(TranslationConfigPayload {
             provider: config.provider.clone(),
             api_key_configured: !config.api_key.is_empty(),
@@ -262,6 +270,161 @@ impl TranslationConfigStore {
             model: config.model.clone(),
         })
     }
+}
+
+fn recover_translation_config(path: &std::path::Path) -> Result<(), String> {
+    let backup_path = path.with_extension("json.bak");
+    if path.exists() {
+        if let Err(error) = fs::remove_file(&backup_path)
+            && error.kind() != ErrorKind::NotFound
+        {
+            return Err(format!(
+                "failed to remove a stale translation configuration backup: {error}"
+            ));
+        }
+    } else if backup_path.exists() {
+        fs::rename(&backup_path, path)
+            .map_err(|error| format!("failed to recover the translation configuration: {error}"))?;
+    }
+    Ok(())
+}
+
+fn persist_translation_config(
+    path: &std::path::Path,
+    config: &TranslationConfig,
+) -> Result<(), String> {
+    let stored = StoredTranslationConfig {
+        provider: config.provider.clone(),
+        api_key: None,
+        endpoint: config.endpoint.clone(),
+        model: config.model.clone(),
+    };
+    let serialized = serde_json::to_vec_pretty(&stored)
+        .map_err(|error| format!("failed to serialize the translation configuration: {error}"))?;
+    let temporary_path = path.with_extension("json.tmp");
+    fs::write(&temporary_path, serialized)
+        .map_err(|error| format!("failed to write the translation configuration: {error}"))?;
+
+    let backup_path = path.with_extension("json.bak");
+    if let Err(error) = fs::remove_file(&backup_path)
+        && error.kind() != ErrorKind::NotFound
+    {
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!(
+            "failed to prepare the translation configuration backup: {error}"
+        ));
+    }
+    let had_existing_config = path.exists();
+    if had_existing_config {
+        fs::rename(path, &backup_path).map_err(|error| {
+            let _ = fs::remove_file(&temporary_path);
+            format!("failed to back up the translation configuration: {error}")
+        })?;
+    }
+    if let Err(error) = fs::rename(&temporary_path, path) {
+        if had_existing_config {
+            let _ = fs::rename(&backup_path, path);
+        }
+        let _ = fs::remove_file(&temporary_path);
+        return Err(format!(
+            "failed to finalize the translation configuration: {error}"
+        ));
+    }
+    if had_existing_config {
+        let _ = fs::remove_file(backup_path);
+    }
+    Ok(())
+}
+
+#[cfg(windows)]
+fn secure_api_key() -> Result<Option<String>, String> {
+    use std::{ffi::c_void, ptr, slice};
+
+    use windows::{
+        Win32::Security::Credentials::{CRED_TYPE_GENERIC, CREDENTIALW, CredFree, CredReadW},
+        core::w,
+    };
+
+    let mut credential: *mut CREDENTIALW = ptr::null_mut();
+    // SAFETY: CredReadW initializes `credential` on success. The returned
+    // allocation is copied immediately and released with CredFree.
+    if unsafe {
+        CredReadW(
+            w!("SnapRust/TranslationApiKey"),
+            CRED_TYPE_GENERIC,
+            None,
+            &mut credential,
+        )
+    }
+    .is_err()
+    {
+        return Ok(None);
+    }
+    if credential.is_null() {
+        return Ok(None);
+    }
+    let value = unsafe {
+        let credential_ref = &*credential;
+        let bytes = slice::from_raw_parts(
+            credential_ref.CredentialBlob,
+            credential_ref.CredentialBlobSize as usize,
+        );
+        String::from_utf8(bytes.to_vec())
+    };
+    // SAFETY: `credential` was allocated by CredReadW and is released once.
+    unsafe { CredFree(credential.cast::<c_void>()) };
+    value
+        .map(Some)
+        .map_err(|error| format!("Windows 凭据中的翻译 API Key 无效：{error}"))
+}
+
+#[cfg(not(windows))]
+fn secure_api_key() -> Result<Option<String>, String> {
+    Ok(None)
+}
+
+#[cfg(windows)]
+fn store_secure_api_key(api_key: Option<&str>) -> Result<(), String> {
+    use windows::{
+        Win32::Security::Credentials::{
+            CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC, CREDENTIALW, CredDeleteW, CredWriteW,
+        },
+        core::{PWSTR, w},
+    };
+
+    let Some(api_key) = api_key else {
+        // Missing credentials are equivalent to an already cleared key.
+        let _ = unsafe { CredDeleteW(w!("SnapRust/TranslationApiKey"), CRED_TYPE_GENERIC, None) };
+        return Ok(());
+    };
+    let mut target = "SnapRust/TranslationApiKey"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut username = "SnapRust"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect::<Vec<_>>();
+    let mut bytes = api_key.as_bytes().to_vec();
+    let credential = CREDENTIALW {
+        Type: CRED_TYPE_GENERIC,
+        TargetName: PWSTR(target.as_mut_ptr()),
+        CredentialBlobSize: u32::try_from(bytes.len())
+            .map_err(|_| "翻译 API Key 太长".to_owned())?,
+        CredentialBlob: bytes.as_mut_ptr(),
+        Persist: CRED_PERSIST_LOCAL_MACHINE,
+        UserName: PWSTR(username.as_mut_ptr()),
+        ..Default::default()
+    };
+    // SAFETY: All pointers reference mutable buffers that remain alive for the
+    // duration of CredWriteW; the API copies their contents before returning.
+    unsafe { CredWriteW(&credential, 0) }
+        .map_err(|error| format!("无法将翻译 API Key 保存到 Windows 凭据管理器：{error}"))
+}
+
+#[cfg(not(windows))]
+fn store_secure_api_key(_api_key: Option<&str>) -> Result<(), String> {
+    Ok(())
 }
 
 impl TranslationConfig {
@@ -643,11 +806,7 @@ async fn translate_with_provider(
 
     let url = reqwest::Url::parse(&format!("{endpoint}/chat/completions"))
         .map_err(|error| format!("翻译服务地址无效: {error}"))?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(TRANSLATION_CONNECT_TIMEOUT)
-        .timeout(TRANSLATION_REQUEST_TIMEOUT)
-        .build()
-        .map_err(|error| format!("无法初始化翻译服务请求: {error}"))?;
+    let client = translation_client()?;
     let response = provider
         .authorize(client.post(url), api_key)
         .json(&request_body)
@@ -683,6 +842,19 @@ async fn translate_with_provider(
     }
 
     provider.parse_response(&body)
+}
+
+fn translation_client() -> Result<reqwest::Client, String> {
+    TRANSLATION_CLIENT
+        .get_or_init(|| {
+            reqwest::Client::builder()
+                .connect_timeout(TRANSLATION_CONNECT_TIMEOUT)
+                .timeout(TRANSLATION_REQUEST_TIMEOUT)
+                .pool_idle_timeout(Duration::from_secs(90))
+                .build()
+                .map_err(|error| format!("无法初始化翻译服务请求: {error}"))
+        })
+        .clone()
 }
 
 fn parse_chat_completion_response(body: &str) -> Result<String, String> {
@@ -770,10 +942,27 @@ fn truncate_error(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::{fs, time::SystemTime};
+
     use super::{
-        TranslationRequestStore, available_models, available_providers, normalize_language_tag,
-        normalize_model, normalize_provider, parse_chat_completion_response, truncate_error,
+        TranslationConfig, TranslationRequestStore, available_models, available_providers,
+        normalize_language_tag, normalize_model, normalize_provider,
+        parse_chat_completion_response, persist_translation_config, recover_translation_config,
+        truncate_error,
     };
+
+    fn test_config_path() -> std::path::PathBuf {
+        std::env::temp_dir()
+            .join(format!(
+                "snaprust-translation-test-{}-{}",
+                std::process::id(),
+                SystemTime::now()
+                    .duration_since(SystemTime::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ))
+            .join("snaprust-translation.json")
+    }
 
     #[test]
     fn validates_language_tags() {
@@ -828,6 +1017,33 @@ mod tests {
         assert!(store.is_cancelled(42).unwrap());
         store.finish(42).unwrap();
         assert!(!store.is_cancelled(42).unwrap());
+    }
+
+    #[test]
+    fn replaces_and_recovers_translation_configuration_without_plaintext_key() {
+        let path = test_config_path();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let mut config = TranslationConfig {
+            provider: "deepseek".to_owned(),
+            api_key: "secret-key".to_owned(),
+            endpoint: "https://api.deepseek.com".to_owned(),
+            model: "deepseek-chat".to_owned(),
+        };
+        persist_translation_config(&path, &config).unwrap();
+        config.model = "deepseek-reasoner".to_owned();
+        persist_translation_config(&path, &config).unwrap();
+
+        let contents = fs::read_to_string(&path).unwrap();
+        assert!(contents.contains("deepseek-reasoner"));
+        assert!(!contents.contains("secret-key"));
+
+        let backup_path = path.with_extension("json.bak");
+        fs::rename(&path, &backup_path).unwrap();
+        recover_translation_config(&path).unwrap();
+        assert!(path.is_file());
+        assert!(!backup_path.exists());
+
+        fs::remove_dir_all(path.parent().unwrap()).unwrap();
     }
 
     #[test]

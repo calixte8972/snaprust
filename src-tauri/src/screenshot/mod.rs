@@ -6,7 +6,13 @@ mod scroll;
 
 pub(crate) use self::monitor::VirtualDesktop;
 
-use std::{sync::Mutex, time::Instant};
+use std::{
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Instant,
+};
 
 use image::{
     ImageEncoder, Rgba, RgbaImage,
@@ -29,10 +35,26 @@ pub struct CapturedScreen {
     capture_ms: f64,
 }
 
-#[derive(Default)]
 pub struct CaptureSession {
     current: Mutex<Option<CapturedScreen>>,
     frame_style: Mutex<FrameStyle>,
+    preparing: AtomicBool,
+    preparation_generation: AtomicU64,
+    scrolling: AtomicBool,
+    scroll_cancelled: Arc<AtomicBool>,
+}
+
+impl Default for CaptureSession {
+    fn default() -> Self {
+        Self {
+            current: Mutex::new(None),
+            frame_style: Mutex::new(FrameStyle::None),
+            preparing: AtomicBool::new(false),
+            preparation_generation: AtomicU64::new(0),
+            scrolling: AtomicBool::new(false),
+            scroll_cancelled: Arc::new(AtomicBool::new(false)),
+        }
+    }
 }
 
 #[derive(Serialize)]
@@ -116,6 +138,21 @@ struct PixelRect {
 }
 
 impl CaptureSession {
+    fn begin_preparation(&self) -> Option<u64> {
+        self.preparing
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| self.preparation_generation.load(Ordering::Acquire))
+    }
+
+    fn finish_preparation(&self) {
+        self.preparing.store(false, Ordering::Release);
+    }
+
+    fn cancel_preparation(&self) {
+        self.preparation_generation.fetch_add(1, Ordering::AcqRel);
+    }
+
     fn replace(&self, capture: CapturedScreen) -> Result<(), String> {
         {
             let mut current = self
@@ -152,6 +189,12 @@ impl CaptureSession {
             .lock()
             .map_err(|_| "capture session lock is poisoned".to_owned())?
             .is_some())
+    }
+
+    pub fn is_busy(&self) -> Result<bool, String> {
+        Ok(self.is_active()?
+            || self.preparing.load(Ordering::Acquire)
+            || self.scrolling.load(Ordering::Acquire))
     }
 
     pub fn payload(&self) -> Result<CapturePayload, String> {
@@ -340,6 +383,23 @@ impl CaptureSession {
             return Err("滚动截图必须基于未旋转的单屏选区".to_owned());
         }
         Ok(region)
+    }
+
+    fn begin_scrolling(&self) -> Result<(PhysicalSelectionRect, Arc<AtomicBool>), String> {
+        let region = self.scrolling_region()?;
+        self.scrolling
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| "长截图正在进行中".to_owned())?;
+        self.scroll_cancelled.store(false, Ordering::Release);
+        Ok((region, Arc::clone(&self.scroll_cancelled)))
+    }
+
+    fn finish_scrolling(&self) {
+        self.scrolling.store(false, Ordering::Release);
+    }
+
+    pub fn cancel_scrolling(&self) {
+        self.scroll_cancelled.store(true, Ordering::Release);
     }
 
     fn complete_scrolling_capture(
@@ -966,50 +1026,68 @@ impl PhysicalSelectionRect {
 
 pub fn begin_capture<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let session = app.state::<CaptureSession>();
-    if session.is_active()? {
+    let Some(generation) = session.begin_preparation() else {
         return Ok(());
-    }
-    // History and settings reuse the capture WebView. Leave those modes before
-    // preparing a new capture, otherwise the global shortcut appears to do
-    // nothing while the overlay is still visible.
-    if crate::window::is_capture_overlay_visible(app)? {
-        crate::window::hide_capture_overlay(app)?;
-    }
+    };
+    let result = (|| {
+        if session.is_active()? {
+            return Ok(());
+        }
+        crate::window::hide_auxiliary_windows(app)?;
+        if crate::window::is_capture_overlay_visible(app)? {
+            crate::window::hide_capture_overlay(app)?;
+        }
 
-    let desktop = monitor::virtual_desktop()?;
-    let capture_started = Instant::now();
-    let image = capture::capture_virtual_desktop(&desktop)?;
-    let capture_ms = elapsed_ms(capture_started);
-    session.replace(CapturedScreen {
-        desktop: desktop.clone(),
-        image: Some(image),
-        selection: None,
-        selection_rect: None,
-        is_scroll_capture: false,
-        annotations: Vec::new(),
-        rotation_quarters: 0,
-        capture_ms,
-    })?;
+        let desktop = monitor::virtual_desktop()?;
+        let capture_started = Instant::now();
+        let image = capture::capture_virtual_desktop(&desktop)?;
+        if session.preparation_generation.load(Ordering::Acquire) != generation {
+            return Err("截图准备已取消".to_owned());
+        }
+        let capture_ms = elapsed_ms(capture_started);
+        session.replace(CapturedScreen {
+            desktop: desktop.clone(),
+            image: Some(image),
+            selection: None,
+            selection_rect: None,
+            is_scroll_capture: false,
+            annotations: Vec::new(),
+            rotation_quarters: 0,
+            capture_ms,
+        })?;
 
-    if let Err(error) = crate::window::prepare_capture_overlay(app, &desktop) {
-        let _ = session.clear();
-        return Err(error);
-    }
-
-    Ok(())
+        if let Err(error) = crate::window::prepare_capture_overlay(app, &desktop) {
+            let _ = session.clear();
+            return Err(error);
+        }
+        Ok(())
+    })();
+    session.finish_preparation();
+    result
 }
 
 pub async fn capture_scrolling<R: Runtime>(
     app: AppHandle<R>,
 ) -> Result<ScrollCapturePayload, String> {
-    let region = app.state::<CaptureSession>().scrolling_region()?;
-    crate::window::hide_capture_overlay(&app)?;
+    let (region, cancelled) = app.state::<CaptureSession>().begin_scrolling()?;
+    if let Err(error) = crate::window::hide_capture_overlay(&app) {
+        app.state::<CaptureSession>().finish_scrolling();
+        return Err(error);
+    }
     let started = Instant::now();
     let output = tauri::async_runtime::spawn_blocking(move || {
-        scroll::capture_scrolling_region(region.x, region.y, region.width, region.height)
+        scroll::capture_scrolling_region(
+            region.x,
+            region.y,
+            region.width,
+            region.height,
+            &cancelled,
+        )
     })
     .await
-    .map_err(|error| format!("滚动截图工作线程失败：{error}"))??;
+    .map_err(|error| format!("滚动截图工作线程失败：{error}"));
+    app.state::<CaptureSession>().finish_scrolling();
+    let output = output??;
     app.state::<CaptureSession>().complete_scrolling_capture(
         output.image,
         output.segments,
@@ -1018,8 +1096,20 @@ pub async fn capture_scrolling<R: Runtime>(
 }
 
 pub fn cancel_capture<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    crate::window::hide_capture_overlay(app)?;
-    app.state::<CaptureSession>().clear()
+    let session = app.state::<CaptureSession>();
+    session.cancel_scrolling();
+    session.cancel_preparation();
+    let hide_result = crate::window::hide_capture_overlay(app);
+    let clear_result = session.clear();
+    hide_result?;
+    clear_result
+}
+
+pub fn cancel_capture_for_auxiliary_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+    if crate::window::is_capture_overlay_visible(app)? || app.state::<CaptureSession>().is_busy()? {
+        cancel_capture(app)?;
+    }
+    Ok(())
 }
 
 pub fn copy_selected_capture<R: Runtime>(
@@ -1034,15 +1124,21 @@ pub fn copy_selected_capture<R: Runtime>(
     let clipboard_started = Instant::now();
     crate::clipboard::write_image(&image)?;
     let clipboard_ms = elapsed_ms(clipboard_started);
-    if let Err(error) = app
-        .state::<crate::history::HistoryStore>()
-        .save(&image, ocr_text)
-    {
-        eprintln!("failed to save copied screenshot in history: {error}");
-    }
+    let width = image.width();
+    let height = image.height();
+    let history_app = app.clone();
+    let history_ocr = ocr_text.map(str::to_owned);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = history_app
+            .state::<crate::history::HistoryStore>()
+            .save(&image, history_ocr.as_deref())
+        {
+            eprintln!("failed to save copied screenshot in history: {error}");
+        }
+    });
     let result = CopyPayload {
-        width: image.width(),
-        height: image.height(),
+        width,
+        height,
         render_ms,
         clipboard_ms,
         total_ms: elapsed_ms(total_started),
@@ -1061,13 +1157,18 @@ pub fn pin_selected_capture<R: Runtime>(
     let render_started = Instant::now();
     let image = session.rendered_selection()?;
     let render_ms = elapsed_ms(render_started);
-    let mut result = crate::pin::create_pin(app, image.clone())?;
-    if let Err(error) = app
-        .state::<crate::history::HistoryStore>()
-        .save(&image, ocr_text)
-    {
-        eprintln!("failed to save pinned screenshot in history: {error}");
-    }
+    let history_image = image.clone();
+    let mut result = crate::pin::create_pin(app, image)?;
+    let history_app = app.clone();
+    let history_ocr = ocr_text.map(str::to_owned);
+    tauri::async_runtime::spawn_blocking(move || {
+        if let Err(error) = history_app
+            .state::<crate::history::HistoryStore>()
+            .save(&history_image, history_ocr.as_deref())
+        {
+            eprintln!("failed to save pinned screenshot in history: {error}");
+        }
+    });
     result.set_pipeline_performance(render_ms, elapsed_ms(total_started));
     crate::window::hide_capture_overlay(app)?;
     session.clear()?;

@@ -25,6 +25,30 @@
         "transparent": true,
         "shadow": false,
         "resizable": false
+      },
+      {
+        "label": "history",
+        "title": "SnapRust 截图历史",
+        "url": "index.html",
+        "visible": false,
+        "width": 1080,
+        "height": 720,
+        "decorations": false,
+        "center": true,
+        "shadow": true,
+        "resizable": true
+      },
+      {
+        "label": "settings",
+        "title": "SnapRust 翻译设置",
+        "url": "index.html",
+        "visible": false,
+        "width": 640,
+        "height": 600,
+        "decorations": false,
+        "center": true,
+        "shadow": true,
+        "resizable": false
       }
     ]
   },

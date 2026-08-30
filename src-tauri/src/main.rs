@@ -23,6 +23,18 @@ fn main() {
         .setup(|app| {
             app.manage(history::HistoryStore::open(app.handle())?);
             app.manage(translation::TranslationConfigStore::open(app.handle())?);
+            for label in ["history", "settings"] {
+                let window = app
+                    .get_webview_window(label)
+                    .ok_or_else(|| format!("{label} window is unavailable"))?;
+                let window_to_hide = window.clone();
+                window.on_window_event(move |event| {
+                    if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                        api.prevent_close();
+                        let _ = window_to_hide.hide();
+                    }
+                });
+            }
             hotkey::register(app.handle())?;
             tray::install(app.handle())?;
             Ok(())
@@ -60,6 +72,7 @@ fn main() {
             commands::delete_history_capture,
             commands::delete_history_captures,
             commands::hide_history_window,
+            commands::hide_settings_window,
             commands::copy_text,
             commands::copy_selected_capture,
             commands::pin_selected_capture,

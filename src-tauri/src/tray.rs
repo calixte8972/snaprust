@@ -44,7 +44,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
-fn close_current_overlay<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
+fn start_capture<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     let overlay_visible = crate::window::is_capture_overlay_visible(app)?;
     let capture_active = app
         .state::<crate::screenshot::CaptureSession>()
@@ -52,27 +52,30 @@ fn close_current_overlay<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     if overlay_visible || capture_active {
         crate::screenshot::cancel_capture(app)?;
     }
-    Ok(())
-}
-
-fn start_capture<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    close_current_overlay(app)?;
     crate::screenshot::begin_capture(app)
 }
 
 fn open_history<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    close_current_overlay(app)?;
+    crate::screenshot::cancel_capture_for_auxiliary_window(app)?;
     crate::history::show_history_window(app)
 }
 
 fn open_settings<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    close_current_overlay(app)?;
+    crate::screenshot::cancel_capture_for_auxiliary_window(app)?;
     crate::window::prepare_settings_window(app)
 }
 
 fn handle_menu_event<R: Runtime>(app: &AppHandle<R>, event: tauri::menu::MenuEvent) {
     let result = match event.id.as_ref() {
-        CAPTURE_ID => start_capture(app),
+        CAPTURE_ID => {
+            let capture_app = app.clone();
+            tauri::async_runtime::spawn_blocking(move || {
+                if let Err(error) = start_capture(&capture_app) {
+                    eprintln!("tray capture action failed: {error}");
+                }
+            });
+            Ok(())
+        }
         HISTORY_ID => open_history(app),
         SETTINGS_ID => open_settings(app),
         QUIT_ID => {

@@ -1,4 +1,5 @@
 import { listen } from "@tauri-apps/api/event";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 
 import {
   cancelCapture,
@@ -18,6 +19,7 @@ import {
   getSelectedCaptureImage,
   getTranslationConfig,
   hideHistoryWindow,
+  hideSettingsWindow,
   listHistory,
   listOcrLanguages,
   listTranslationModels,
@@ -56,6 +58,7 @@ import {
 } from "./selection";
 import { mosaicRgbaPixels } from "./image-processing";
 import { waitForCompositorWarmup } from "./window-readiness";
+import { createAsyncPool } from "./async-pool";
 import "./style.css";
 
 function requireElement<Element extends HTMLElement>(selector: string): Element {
@@ -68,6 +71,13 @@ function requireElement<Element extends HTMLElement>(selector: string): Element 
 }
 
 const overlay = requireElement("#capture-overlay");
+const currentWindowLabel = getCurrentWindow().label;
+if (currentWindowLabel === "history" || currentWindowLabel === "settings") {
+  // The native window may become visible immediately after its show event is
+  // queued. Route its base styling before that event to avoid flashing the
+  // transparent capture surface.
+  overlay.dataset.state = currentWindowLabel;
+}
 const captureImage = requireElement<HTMLImageElement>("#capture-image");
 const settingsPanel = requireElement("#settings-panel");
 const settingsClose = requireElement<HTMLButtonElement>("#settings-close");
@@ -206,6 +216,7 @@ let historyLoadVersion = 0;
 let historySearchTimer: number | null = null;
 const historyThumbnailUrls = new Map<number, string>();
 let historyThumbnailObserver: IntersectionObserver | null = null;
+const loadHistoryThumbnailWithLimit = createAsyncPool(6);
 let historyVisibleIds: number[] = [];
 const selectedHistoryIds = new Set<number>();
 
@@ -284,7 +295,11 @@ function observeHistoryThumbnail(image: HTMLImageElement, id: number): void {
         const targetId = Number(target.dataset.historyId);
         historyThumbnailObserver?.unobserve(target);
         if (Number.isInteger(targetId)) {
-          void loadHistoryThumbnail(targetId, target, historyLoadVersion);
+          const version = historyLoadVersion;
+          void loadHistoryThumbnailWithLimit(async () => {
+            if (version !== historyLoadVersion || historyPanel.hidden) return;
+            await loadHistoryThumbnail(targetId, target, version);
+          });
         }
       }
     },
@@ -407,6 +422,16 @@ function makeHistoryAction(label: string, title: string): HTMLButtonElement {
   return button;
 }
 
+function renderHistoryTags(container: HTMLElement, values: ReadonlyArray<string>): void {
+  container.replaceChildren();
+  values.forEach((tag) => {
+    const chip = document.createElement("span");
+    chip.className = "history-tag";
+    chip.textContent = tag;
+    container.append(chip);
+  });
+}
+
 function updateHistoryBatchControls(): void {
   const selectedCount = selectedHistoryIds.size;
   const visibleCount = historyVisibleIds.length;
@@ -476,12 +501,7 @@ function renderHistory(items: ReadonlyArray<HistoryItemPayload>): void {
     preview.textContent = historyOcrPreview(item);
     const tags = document.createElement("div");
     tags.className = "history-card__tags";
-    item.tags.forEach((tag) => {
-      const chip = document.createElement("span");
-      chip.className = "history-tag";
-      chip.textContent = tag;
-      tags.append(chip);
-    });
+    renderHistoryTags(tags, item.tags);
     const tagEditor = document.createElement("form");
     tagEditor.className = "history-card__tag-editor";
     tagEditor.hidden = true;
@@ -499,13 +519,14 @@ function renderHistory(items: ReadonlyArray<HistoryItemPayload>): void {
     const copy = makeHistoryAction("复制", "复制图片到剪贴板");
     const pin = makeHistoryAction("📌", "重新钉图");
     const favorite = makeHistoryAction(item.favorite ? "★" : "☆", item.favorite ? "取消收藏" : "收藏");
+    favorite.dataset.favorite = String(item.favorite);
     favorite.classList.toggle("is-favorite", item.favorite);
     const editTags = makeHistoryAction("标签", "编辑标签");
     const remove = makeHistoryAction("删除", "永久删除这条历史记录和图片");
     remove.classList.add("history-card__action--danger");
     copy.addEventListener("click", () => void copyHistory(item.id, copy));
     pin.addEventListener("click", () => void pinHistory(item.id, pin));
-    favorite.addEventListener("click", () => void toggleHistoryFavorite(item, favorite));
+    favorite.addEventListener("click", () => void toggleHistoryFavorite(item.id, favorite));
     editTags.addEventListener("click", () => {
       tagEditor.hidden = false;
       tagInput.focus();
@@ -513,7 +534,7 @@ function renderHistory(items: ReadonlyArray<HistoryItemPayload>): void {
     });
     tagEditor.addEventListener("submit", (event) => {
       event.preventDefault();
-      void saveHistoryTags(item.id, parseHistoryTags(tagInput.value), tagSave);
+      void saveHistoryTags(item.id, parseHistoryTags(tagInput.value), tagSave, tags, tagEditor);
     });
     remove.addEventListener("click", () => void removeHistory(item));
     actions.append(copy, pin, favorite, editTags, remove);
@@ -597,22 +618,35 @@ async function pinHistory(id: number, button: HTMLButtonElement): Promise<void> 
   }
 }
 
-async function toggleHistoryFavorite(item: HistoryItemPayload, button: HTMLButtonElement): Promise<void> {
+async function toggleHistoryFavorite(id: number, button: HTMLButtonElement): Promise<void> {
   button.disabled = true;
+  const nextFavorite = button.dataset.favorite !== "true";
   try {
-    await setHistoryFavorite(item.id, !item.favorite);
-    void loadHistory();
+    await setHistoryFavorite(id, nextFavorite);
+    button.dataset.favorite = String(nextFavorite);
+    button.textContent = nextFavorite ? "★" : "☆";
+    button.title = nextFavorite ? "取消收藏" : "收藏";
+    button.classList.toggle("is-favorite", nextFavorite);
+    button.disabled = false;
   } catch (error) {
     button.disabled = false;
     console.error("failed to update history favorite", error);
   }
 }
 
-async function saveHistoryTags(id: number, tags: ReadonlyArray<string>, button: HTMLButtonElement): Promise<void> {
+async function saveHistoryTags(
+  id: number,
+  tags: ReadonlyArray<string>,
+  button: HTMLButtonElement,
+  tagContainer: HTMLElement,
+  editor: HTMLElement,
+): Promise<void> {
   button.disabled = true;
   try {
     await setHistoryTags(id, tags);
-    void loadHistory();
+    renderHistoryTags(tagContainer, tags);
+    editor.hidden = true;
+    button.disabled = false;
   } catch (error) {
     button.disabled = false;
     console.error("failed to update history tags", error);
@@ -1236,7 +1270,9 @@ function commitAnnotation(annotation: Annotation): void {
   annotations = [...annotations, annotation];
   annotationRedoStack = [];
   annotationDraft = null;
-  rebuildCommittedAnnotationCanvas();
+  drawAnnotation(annotation, committedAnnotationContext);
+  updateAnnotationStatus();
+  renderAnnotationCanvas();
 }
 
 async function openAnnotationEditor(selected: SelectionPayload): Promise<Readonly<{
@@ -1427,7 +1463,7 @@ async function captureLongScreenshot(): Promise<void> {
   annotationTranslate.disabled = true;
   annotationPin.disabled = true;
   annotationFrameSelect.disabled = true;
-  annotationStatus.textContent = "正在隐藏编辑器并自动滚动拼接，请暂时不要操作目标窗口…";
+  annotationStatus.textContent = "正在隐藏编辑器并自动滚动拼接；按 Esc 可取消，请暂时不要操作目标窗口…";
   const version = captureSessionVersion;
   let overlayHidden = false;
 
@@ -1601,11 +1637,11 @@ function closeTranslationSettings(): void {
   settingsInProgress = false;
   settingsSave.disabled = false;
   settingsTest.disabled = false;
-  if (overlay.dataset.state === "settings") {
-    void cancel();
-  } else {
-    settingsPanel.hidden = true;
-  }
+  settingsPanel.hidden = true;
+  overlay.dataset.state = "idle";
+  void hideSettingsWindow().catch((error) => {
+    console.error("failed to hide translation settings window", error);
+  });
 }
 
 async function saveTranslationSettings(testConnection: boolean): Promise<void> {
@@ -2512,7 +2548,7 @@ annotationCanvas.addEventListener("pointermove", (event) => {
       if (previous && Math.hypot(point.x - previous.x, point.y - previous.y) < minimumDistance) {
         return;
       }
-      annotationDraft = { ...annotationDraft, points: [...annotationDraft.points, point] };
+      annotationDraft.points.push(point);
       break;
     }
     default: break;

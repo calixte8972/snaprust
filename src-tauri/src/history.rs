@@ -75,6 +75,13 @@ pub struct HistoryStore {
     images_directory: PathBuf,
     thumbnails_directory: PathBuf,
     next_filename: AtomicU64,
+    usage_cache: Mutex<HistoryUsageSnapshot>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct HistoryUsageSnapshot {
+    item_count: usize,
+    image_bytes: u64,
 }
 
 impl HistoryStore {
@@ -123,12 +130,19 @@ impl HistoryStore {
         ensure_tags_column(&connection)?;
         reconcile_filesystem(&connection, &images_directory, &thumbnails_directory)?;
 
-        Ok(Self {
+        let store = Self {
             connection: Mutex::new(connection),
             images_directory,
             thumbnails_directory,
             next_filename: AtomicU64::new(0),
-        })
+            usage_cache: Mutex::new(HistoryUsageSnapshot::default()),
+        };
+        let initial_usage = store.calculate_usage()?;
+        *store
+            .usage_cache
+            .lock()
+            .map_err(|_| "screenshot history usage lock is poisoned".to_owned())? = initial_usage;
+        Ok(store)
     }
 
     pub fn save(&self, image: &RgbaImage, ocr_text: Option<&str>) -> Result<i64, String> {
@@ -178,6 +192,14 @@ impl HistoryStore {
         })();
         match database_result {
             Ok(id) => {
+                {
+                    let mut usage = self
+                        .usage_cache
+                        .lock()
+                        .map_err(|_| "screenshot history usage lock is poisoned".to_owned())?;
+                    usage.item_count = usage.item_count.saturating_add(1);
+                    usage.image_bytes = usage.image_bytes.saturating_add(png.len() as u64);
+                }
                 if let Err(error) =
                     self.cleanup_retention(MAX_HISTORY_ITEMS, MAX_HISTORY_IMAGE_BYTES)
                 {
@@ -320,15 +342,34 @@ impl HistoryStore {
     }
 
     pub fn set_favorite_batch(&self, ids: Vec<i64>, favorite: bool) -> Result<(), String> {
-        for id in normalize_batch_ids(ids)? {
-            self.set_favorite(id, favorite)?;
+        let ids = normalize_batch_ids(ids)?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| "screenshot history database lock is poisoned".to_owned())?;
+        let transaction = connection
+            .transaction()
+            .map_err(|error| format!("failed to start history favorite transaction: {error}"))?;
+        for id in ids {
+            let changed = transaction
+                .execute(
+                    "UPDATE screenshots SET favorite = ?1 WHERE id = ?2",
+                    params![i64::from(favorite), id],
+                )
+                .map_err(|error| format!("failed to update screenshot favorite state: {error}"))?;
+            if changed == 0 {
+                return Err(format!("screenshot history entry does not exist: {id}"));
+            }
         }
-        Ok(())
+        transaction
+            .commit()
+            .map_err(|error| format!("failed to commit history favorite transaction: {error}"))
     }
 
     pub fn delete(&self, id: i64) -> Result<(), String> {
         let filename = self.filename_for_id(id)?;
         let image_path = self.image_path_from_filename(&filename)?;
+        let image_bytes = self.image_file_size(&filename)?;
         let thumbnail_path = self.thumbnail_path_from_filename(&filename)?;
         let tombstone_path = image_path.with_extension("deleting");
         if tombstone_path.exists() {
@@ -381,6 +422,12 @@ impl HistoryStore {
         {
             eprintln!("failed to remove screenshot history thumbnail: {error}");
         }
+        let mut usage = self
+            .usage_cache
+            .lock()
+            .map_err(|_| "screenshot history usage lock is poisoned".to_owned())?;
+        usage.item_count = usage.item_count.saturating_sub(1);
+        usage.image_bytes = usage.image_bytes.saturating_sub(image_bytes);
         Ok(())
     }
 
@@ -392,13 +439,13 @@ impl HistoryStore {
     }
 
     pub fn usage(&self) -> Result<HistoryUsagePayload, String> {
-        let entries = self.stored_entries()?;
-        let image_bytes = entries.iter().try_fold(0_u64, |total, entry| {
-            Ok::<_, String>(total.saturating_add(self.image_file_size(&entry.filename)?))
-        })?;
+        let usage = *self
+            .usage_cache
+            .lock()
+            .map_err(|_| "screenshot history usage lock is poisoned".to_owned())?;
         Ok(HistoryUsagePayload {
-            item_count: entries.len(),
-            image_bytes,
+            item_count: usage.item_count,
+            image_bytes: usage.image_bytes,
             max_items: MAX_HISTORY_ITEMS,
             max_image_bytes: MAX_HISTORY_IMAGE_BYTES,
         })
@@ -466,11 +513,16 @@ impl HistoryStore {
         maximum_items: usize,
         maximum_image_bytes: u64,
     ) -> Result<usize, String> {
+        let usage = *self
+            .usage_cache
+            .lock()
+            .map_err(|_| "screenshot history usage lock is poisoned".to_owned())?;
+        if usage.item_count <= maximum_items && usage.image_bytes <= maximum_image_bytes {
+            return Ok(0);
+        }
         let entries = self.stored_entries()?;
-        let mut remaining_items = entries.len();
-        let mut remaining_image_bytes = entries.iter().try_fold(0_u64, |total, entry| {
-            Ok::<_, String>(total.saturating_add(self.image_file_size(&entry.filename)?))
-        })?;
+        let mut remaining_items = usage.item_count;
+        let mut remaining_image_bytes = usage.image_bytes;
         let mut deleted = 0;
         for entry in entries.iter().filter(|entry| !entry.favorite) {
             if remaining_items <= maximum_items && remaining_image_bytes <= maximum_image_bytes {
@@ -483,6 +535,17 @@ impl HistoryStore {
             deleted += 1;
         }
         Ok(deleted)
+    }
+
+    fn calculate_usage(&self) -> Result<HistoryUsageSnapshot, String> {
+        let entries = self.stored_entries()?;
+        let image_bytes = entries.iter().try_fold(0_u64, |total, entry| {
+            Ok::<_, String>(total.saturating_add(self.image_file_size(&entry.filename)?))
+        })?;
+        Ok(HistoryUsageSnapshot {
+            item_count: entries.len(),
+            image_bytes,
+        })
     }
 
     fn stored_entries(&self) -> Result<Vec<StoredHistoryEntry>, String> {
@@ -860,7 +923,7 @@ pub fn show_history_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String>
 }
 
 pub fn hide_history_window<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
-    crate::window::hide_capture_overlay(app)
+    crate::window::hide_history_window(app)
 }
 
 #[cfg(test)]
@@ -900,6 +963,9 @@ mod tests {
         let image = RgbaImage::from_pixel(48, 24, Rgba([12, 34, 56, 255]));
         let id = store.save(&image, Some("Rust OCR history")).unwrap();
         let filename = store.filename_for_id(id).unwrap();
+        let saved_usage = store.usage().unwrap();
+        assert_eq!(saved_usage.item_count, 1);
+        assert!(saved_usage.image_bytes > 0);
         assert!(directory.join("thumbnails").join(&filename).is_file());
 
         let items = store.list(Some("OCR"), false).unwrap();
@@ -926,6 +992,9 @@ mod tests {
         let tagged = store.list(Some("代码"), false).unwrap();
         assert_eq!(tagged[0].tags, ["代码", "OCR"]);
         store.delete(id).unwrap();
+        let deleted_usage = store.usage().unwrap();
+        assert_eq!(deleted_usage.item_count, 0);
+        assert_eq!(deleted_usage.image_bytes, 0);
         assert!(store.list(None, false).unwrap().is_empty());
         assert!(store.image(id).is_err());
         assert!(!directory.join("thumbnails").join(filename).exists());
@@ -1004,6 +1073,7 @@ mod tests {
 
         assert_eq!(unique_ids.len(), ids.len());
         assert_eq!(store.list(None, false).unwrap().len(), ids.len());
+        assert_eq!(store.usage().unwrap().item_count, ids.len());
 
         drop(store);
         fs::remove_dir_all(directory).unwrap();

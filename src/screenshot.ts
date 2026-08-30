@@ -171,7 +171,7 @@ export type Annotation =
   | Readonly<{ kind: "arrow"; start: AnnotationPoint; end: AnnotationPoint; color: string; width: number }>
   | Readonly<{ kind: "rectangle"; rect: AnnotationRect; color: string; width: number }>
   | Readonly<{ kind: "ellipse"; rect: AnnotationRect; color: string; width: number }>
-  | Readonly<{ kind: "brush"; points: ReadonlyArray<AnnotationPoint>; color: string; width: number }>
+  | Readonly<{ kind: "brush"; points: AnnotationPoint[]; color: string; width: number }>
   | Readonly<{ kind: "mosaic"; rect: AnnotationRect; blockSize: number }>
   | Readonly<{ kind: "text"; position: AnnotationPoint; text: string; color: string; fontSize: number }>;
 
@@ -341,6 +341,10 @@ export async function deleteHistoryCaptures(ids: ReadonlyArray<number>): Promise
 
 export async function hideHistoryWindow(): Promise<void> {
   await invoke("hide_history_window");
+}
+
+export async function hideSettingsWindow(): Promise<void> {
+  await invoke("hide_settings_window");
 }
 
 export async function getPinnedCapture(label: string): Promise<PinMetadata> {

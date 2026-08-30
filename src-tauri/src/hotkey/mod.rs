@@ -17,14 +17,17 @@ pub fn plugin<R: Runtime>() -> TauriPlugin<R> {
 
     tauri_plugin_global_shortcut::Builder::new()
         .with_handler(move |app, shortcut, event| {
-            if shortcut == &capture_shortcut
-                && event.state() == ShortcutState::Pressed
-                && let Err(error) = crate::screenshot::begin_capture(app)
-            {
-                eprintln!("failed to enter capture mode: {error}");
+            if shortcut == &capture_shortcut && event.state() == ShortcutState::Pressed {
+                let capture_app = app.clone();
+                tauri::async_runtime::spawn_blocking(move || {
+                    if let Err(error) = crate::screenshot::begin_capture(&capture_app) {
+                        eprintln!("failed to enter capture mode: {error}");
+                    }
+                });
             } else if shortcut == &history_shortcut
                 && event.state() == ShortcutState::Pressed
-                && let Err(error) = crate::history::show_history_window(app)
+                && let Err(error) = crate::screenshot::cancel_capture_for_auxiliary_window(app)
+                    .and_then(|()| crate::history::show_history_window(app))
             {
                 eprintln!("failed to open history: {error}");
             }

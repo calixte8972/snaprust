@@ -1,10 +1,16 @@
 //! Automatic scrolling capture and overlap-based vertical stitching.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
 use image::RgbaImage;
 
 const MAX_SCROLL_SEGMENTS: usize = 24;
-const MAX_SCROLL_IMAGE_HEIGHT: u32 = 40_000;
-const MAX_SCROLL_IMAGE_PIXELS: u64 = 60_000_000;
+// WebView2 canvas allocations are substantially more expensive than the Rust
+// RGBA buffer because the editor keeps a source image and two drawing layers.
+// Keep long captures below a predictable memory ceiling until the editor uses
+// tiled canvases.
+const MAX_SCROLL_IMAGE_HEIGHT: u32 = 16_000;
+const MAX_SCROLL_IMAGE_PIXELS: u64 = 16_000_000;
 const DUPLICATE_SCORE: f64 = 2.0;
 const MAX_OVERLAP_SCORE: f64 = 28.0;
 
@@ -19,13 +25,18 @@ pub(super) fn capture_scrolling_region(
     y: i32,
     width: u32,
     height: u32,
+    cancelled: &AtomicBool,
 ) -> Result<ScrollCaptureOutput, String> {
     use std::{thread, time::Duration};
 
     use windows::Win32::{
         Foundation::POINT,
-        UI::WindowsAndMessaging::{
-            GA_ROOT, GetAncestor, PostMessageW, SetForegroundWindow, WM_MOUSEWHEEL, WindowFromPoint,
+        UI::{
+            Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE},
+            WindowsAndMessaging::{
+                GA_ROOT, GetAncestor, PostMessageW, SetForegroundWindow, WM_MOUSEWHEEL,
+                WindowFromPoint,
+            },
         },
     };
 
@@ -61,53 +72,80 @@ pub(super) fn capture_scrolling_region(
     let mut segments = 1;
     let wheel_lparam = pack_screen_point(center_x, center_y);
 
-    for _ in 1..MAX_SCROLL_SEGMENTS {
-        let wheel_wparam = pack_wheel_delta(-480);
-        // SAFETY: target was returned by WindowFromPoint. The message contains
-        // only ordinary mouse-wheel coordinates and no borrowed pointers.
-        unsafe { PostMessageW(Some(target), WM_MOUSEWHEEL, wheel_wparam, wheel_lparam) }
-            .map_err(|error| format!("无法向目标窗口发送滚轮消息：{error}"))?;
-        thread::sleep(Duration::from_millis(260));
+    let mut scroll_steps = 0_usize;
+    let capture_result = (|| {
+        for _ in 1..MAX_SCROLL_SEGMENTS {
+            if cancelled.load(Ordering::Acquire)
+                || unsafe { GetAsyncKeyState(i32::from(VK_ESCAPE.0)) } < 0
+            {
+                return Err("长截图已取消".to_owned());
+            }
+            let wheel_wparam = pack_wheel_delta(-480);
+            // SAFETY: target was returned by WindowFromPoint. The message contains
+            // only ordinary mouse-wheel coordinates and no borrowed pointers.
+            unsafe { PostMessageW(Some(target), WM_MOUSEWHEEL, wheel_wparam, wheel_lparam) }
+                .map_err(|error| format!("无法向目标窗口发送滚轮消息：{error}"))?;
+            scroll_steps += 1;
+            let next = capture_stable_region(x, y, width, height, cancelled)?;
+            if image_difference(&previous, &next, 0).unwrap_or(f64::MAX) <= DUPLICATE_SCORE {
+                break;
+            }
 
-        let next = super::capture::capture_screen_region(x, y, width, height)?;
-        if image_difference(&previous, &next, 0).unwrap_or(f64::MAX) <= DUPLICATE_SCORE {
-            break;
+            let Some((offset, score)) = find_vertical_offset(&previous, &next) else {
+                if segments == 1 {
+                    return Err(
+                        "未找到相邻画面的重叠区域；请缩小滚动速度或选择静态内容区域".to_owned()
+                    );
+                }
+                break;
+            };
+            if score > MAX_OVERLAP_SCORE {
+                if segments == 1 {
+                    return Err(
+                        "滚动画面变化过大，无法可靠拼接；请避开视频、动画或悬浮内容".to_owned()
+                    );
+                }
+                break;
+            }
+            let next_height = stitched
+                .height()
+                .checked_add(offset)
+                .ok_or_else(|| "滚动截图高度溢出".to_owned())?;
+            if next_height > MAX_SCROLL_IMAGE_HEIGHT {
+                break;
+            }
+            if u64::from(stitched.width()) * u64::from(next_height) > MAX_SCROLL_IMAGE_PIXELS {
+                break;
+            }
+            stitched = append_scrolled_frame(stitched, &next, offset)?;
+            previous = next;
+            segments += 1;
         }
 
-        let Some((offset, score)) = find_vertical_offset(&previous, &next) else {
-            if segments == 1 {
-                return Err("未找到相邻画面的重叠区域；请缩小滚动速度或选择静态内容区域".to_owned());
-            }
-            break;
+        if segments == 1 {
+            return Err("目标窗口没有发生可识别的滚动，请确认选区位于可滚动内容上".to_owned());
+        }
+        Ok(ScrollCaptureOutput {
+            image: stitched,
+            segments,
+        })
+    })();
+
+    // Keep the target application close to its original scroll position even
+    // when stitching fails or the user cancels. Wheel messages are symmetric,
+    // so this is best-effort for applications with custom scroll acceleration.
+    for _ in 0..scroll_steps {
+        let _ = unsafe {
+            PostMessageW(
+                Some(target),
+                WM_MOUSEWHEEL,
+                pack_wheel_delta(480),
+                wheel_lparam,
+            )
         };
-        if score > MAX_OVERLAP_SCORE {
-            if segments == 1 {
-                return Err("滚动画面变化过大，无法可靠拼接；请避开视频、动画或悬浮内容".to_owned());
-            }
-            break;
-        }
-        let next_height = stitched
-            .height()
-            .checked_add(offset)
-            .ok_or_else(|| "滚动截图高度溢出".to_owned())?;
-        if next_height > MAX_SCROLL_IMAGE_HEIGHT {
-            break;
-        }
-        if u64::from(stitched.width()) * u64::from(next_height) > MAX_SCROLL_IMAGE_PIXELS {
-            break;
-        }
-        stitched = append_scrolled_frame(stitched, &next, offset)?;
-        previous = next;
-        segments += 1;
+        thread::sleep(Duration::from_millis(12));
     }
-
-    if segments == 1 {
-        return Err("目标窗口没有发生可识别的滚动，请确认选区位于可滚动内容上".to_owned());
-    }
-    Ok(ScrollCaptureOutput {
-        image: stitched,
-        segments,
-    })
+    capture_result
 }
 
 #[cfg(windows)]
@@ -127,8 +165,38 @@ pub(super) fn capture_scrolling_region(
     _y: i32,
     _width: u32,
     _height: u32,
+    _cancelled: &AtomicBool,
 ) -> Result<ScrollCaptureOutput, String> {
     Err("滚动截图目前仅支持 Windows".to_owned())
+}
+
+#[cfg(windows)]
+fn capture_stable_region(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    cancelled: &AtomicBool,
+) -> Result<RgbaImage, String> {
+    use std::{thread, time::Duration};
+    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
+
+    thread::sleep(Duration::from_millis(120));
+    let mut previous = super::capture::capture_screen_region(x, y, width, height)?;
+    for _ in 0..7 {
+        if cancelled.load(Ordering::Acquire)
+            || unsafe { GetAsyncKeyState(i32::from(VK_ESCAPE.0)) } < 0
+        {
+            return Err("长截图已取消".to_owned());
+        }
+        thread::sleep(Duration::from_millis(90));
+        let current = super::capture::capture_screen_region(x, y, width, height)?;
+        if image_difference(&previous, &current, 0).unwrap_or(f64::MAX) <= DUPLICATE_SCORE {
+            return Ok(current);
+        }
+        previous = current;
+    }
+    Ok(previous)
 }
 
 fn find_vertical_offset(previous: &RgbaImage, next: &RgbaImage) -> Option<(u32, f64)> {
@@ -183,13 +251,51 @@ fn image_difference(previous: &RgbaImage, next: &RgbaImage, offset: u32) -> Opti
     if end_y <= start_y {
         return None;
     }
-    let x_step = (previous.width() / 180).max(1) as usize;
+    let horizontal_margin = (previous.width() / 40).min(32);
+    let usable_width = previous.width().saturating_sub(horizontal_margin * 2);
+    if usable_width < 5 {
+        return None;
+    }
+    let band_width = (usable_width / 5).max(1);
+    let mut band_scores = Vec::with_capacity(5);
+    for band in 0..5 {
+        let start_x = horizontal_margin + band * band_width;
+        let end_x = if band == 4 {
+            previous.width() - horizontal_margin
+        } else {
+            (start_x + band_width).min(previous.width() - horizontal_margin)
+        };
+        if let Some(score) =
+            image_band_difference(previous, next, offset, start_y, end_y, start_x, end_x)
+        {
+            band_scores.push(score);
+        }
+    }
+    band_scores.sort_by(f64::total_cmp);
+    band_scores.get(band_scores.len() / 2).copied()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn image_band_difference(
+    previous: &RgbaImage,
+    next: &RgbaImage,
+    offset: u32,
+    start_y: u32,
+    end_y: u32,
+    start_x: u32,
+    end_x: u32,
+) -> Option<f64> {
+    if end_x <= start_x || end_y <= start_y {
+        return None;
+    }
+    let overlap_height = previous.height() - offset;
+    let x_step = ((end_x - start_x) / 36).max(1) as usize;
     let y_step = (overlap_height / 120).max(1) as usize;
     let mut difference = 0_u64;
     let mut samples = 0_u64;
 
     for y in (start_y..end_y).step_by(y_step) {
-        for x in (0..previous.width()).step_by(x_step) {
+        for x in (start_x..end_x).step_by(x_step) {
             let left = previous.get_pixel(x, y + offset).0;
             let right = next.get_pixel(x, y).0;
             difference += u64::from(left[0].abs_diff(right[0]));

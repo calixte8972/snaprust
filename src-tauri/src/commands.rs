@@ -9,8 +9,10 @@ use crate::{
 };
 
 #[tauri::command]
-pub fn show_capture_overlay<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
-    crate::screenshot::begin_capture(&app)
+pub async fn show_capture_overlay<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || crate::screenshot::begin_capture(&app))
+        .await
+        .map_err(|error| format!("capture worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -163,15 +165,26 @@ pub async fn translate_text(
     request_id: Option<u64>,
 ) -> Result<crate::translation::TranslationPayload, String> {
     let config = store.snapshot()?;
-    if let Some(request_id) = request_id {
-        request_store.begin(request_id)?;
-        if request_store.is_cancelled(request_id)? {
-            request_store.finish(request_id)?;
-            return Err("翻译已取消".to_owned());
+    let result = if let Some(request_id) = request_id {
+        let cancellation = request_store.begin(request_id)?;
+        match futures_util::future::select(
+            Box::pin(crate::translation::translate(
+                text,
+                target_language,
+                source_language,
+                model,
+                config,
+            )),
+            Box::pin(cancellation.notified()),
+        )
+        .await
+        {
+            futures_util::future::Either::Left((result, _)) => result,
+            futures_util::future::Either::Right(_) => Err("翻译已取消".to_owned()),
         }
-    }
-    let result =
-        crate::translation::translate(text, target_language, source_language, model, config).await;
+    } else {
+        crate::translation::translate(text, target_language, source_language, model, config).await
+    };
     if let Some(request_id) = request_id {
         let cancelled = request_store.is_cancelled(request_id)?;
         request_store.finish(request_id)?;
@@ -196,11 +209,15 @@ pub fn copy_text(text: String) -> Result<(), String> {
 }
 
 #[tauri::command]
-pub fn copy_selected_capture<R: Runtime>(
+pub async fn copy_selected_capture<R: Runtime>(
     app: AppHandle<R>,
     ocr_text: Option<String>,
 ) -> Result<CopyPayload, String> {
-    crate::screenshot::copy_selected_capture(&app, ocr_text.as_deref())
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::screenshot::copy_selected_capture(&app, ocr_text.as_deref())
+    })
+    .await
+    .map_err(|error| format!("copy worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -208,48 +225,72 @@ pub async fn pin_selected_capture<R: Runtime>(
     app: AppHandle<R>,
     ocr_text: Option<String>,
 ) -> Result<crate::pin::PinCreatedPayload, String> {
-    crate::screenshot::pin_selected_capture(&app, ocr_text.as_deref())
+    tauri::async_runtime::spawn_blocking(move || {
+        crate::screenshot::pin_selected_capture(&app, ocr_text.as_deref())
+    })
+    .await
+    .map_err(|error| format!("pin worker failed: {error}"))?
 }
 
 #[tauri::command]
-pub fn list_history(
+pub async fn list_history<R: Runtime>(
     query: Option<String>,
     favorites_only: bool,
-    store: State<'_, crate::history::HistoryStore>,
+    app: AppHandle<R>,
 ) -> Result<Vec<crate::history::HistoryItemPayload>, String> {
-    store.list(query.as_deref(), favorites_only)
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<crate::history::HistoryStore>()
+            .list(query.as_deref(), favorites_only)
+    })
+    .await
+    .map_err(|error| format!("history list worker failed: {error}"))?
 }
 
 #[tauri::command]
-pub fn get_history_usage(
-    store: State<'_, crate::history::HistoryStore>,
+pub async fn get_history_usage<R: Runtime>(
+    app: AppHandle<R>,
 ) -> Result<crate::history::HistoryUsagePayload, String> {
-    store.usage()
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<crate::history::HistoryStore>().usage()
+    })
+    .await
+    .map_err(|error| format!("history usage worker failed: {error}"))?
 }
 
 #[tauri::command]
-pub fn get_history_thumbnail(
+pub async fn get_history_thumbnail<R: Runtime>(
     id: i64,
-    store: State<'_, crate::history::HistoryStore>,
+    app: AppHandle<R>,
 ) -> Result<tauri::ipc::Response, String> {
-    Ok(tauri::ipc::Response::new(store.thumbnail_png(id)?))
+    let png = tauri::async_runtime::spawn_blocking(move || {
+        app.state::<crate::history::HistoryStore>()
+            .thumbnail_png(id)
+    })
+    .await
+    .map_err(|error| format!("history thumbnail worker failed: {error}"))??;
+    Ok(tauri::ipc::Response::new(png))
 }
 
 #[tauri::command]
-pub fn copy_history_capture(
-    id: i64,
-    store: State<'_, crate::history::HistoryStore>,
-) -> Result<(), String> {
-    store.copy(id)
+pub async fn copy_history_capture<R: Runtime>(id: i64, app: AppHandle<R>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<crate::history::HistoryStore>().copy(id)
+    })
+    .await
+    .map_err(|error| format!("history copy worker failed: {error}"))?
 }
 
 #[tauri::command]
-pub fn pin_history_capture<R: Runtime>(
+pub async fn pin_history_capture<R: Runtime>(
     id: i64,
     app: AppHandle<R>,
 ) -> Result<crate::pin::PinCreatedPayload, String> {
-    let image = app.state::<crate::history::HistoryStore>().image(id)?;
-    crate::pin::create_pin(&app, image)
+    tauri::async_runtime::spawn_blocking(move || {
+        let image = app.state::<crate::history::HistoryStore>().image(id)?;
+        crate::pin::create_pin(&app, image)
+    })
+    .await
+    .map_err(|error| format!("history pin worker failed: {error}"))?
 }
 
 #[tauri::command]
@@ -280,33 +321,48 @@ pub fn set_history_favorite_batch(
 }
 
 #[tauri::command]
-pub fn export_history_captures<R: Runtime>(
+pub async fn export_history_captures<R: Runtime>(
     ids: Vec<i64>,
     app: AppHandle<R>,
 ) -> Result<crate::history::HistoryExportPayload, String> {
-    app.state::<crate::history::HistoryStore>()
-        .export(&app, ids)
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<crate::history::HistoryStore>()
+            .export(&app, ids)
+    })
+    .await
+    .map_err(|error| format!("history export worker failed: {error}"))?
 }
 
 #[tauri::command]
-pub fn delete_history_capture(
-    id: i64,
-    store: State<'_, crate::history::HistoryStore>,
-) -> Result<(), String> {
-    store.delete(id)
+pub async fn delete_history_capture<R: Runtime>(id: i64, app: AppHandle<R>) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<crate::history::HistoryStore>().delete(id)
+    })
+    .await
+    .map_err(|error| format!("history delete worker failed: {error}"))?
 }
 
 #[tauri::command]
-pub fn delete_history_captures(
+pub async fn delete_history_captures<R: Runtime>(
     ids: Vec<i64>,
-    store: State<'_, crate::history::HistoryStore>,
+    app: AppHandle<R>,
 ) -> Result<(), String> {
-    store.delete_batch(ids)
+    tauri::async_runtime::spawn_blocking(move || {
+        app.state::<crate::history::HistoryStore>()
+            .delete_batch(ids)
+    })
+    .await
+    .map_err(|error| format!("history batch delete worker failed: {error}"))?
 }
 
 #[tauri::command]
 pub fn hide_history_window<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     crate::history::hide_history_window(&app)
+}
+
+#[tauri::command]
+pub fn hide_settings_window<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
+    crate::window::hide_settings_window(&app)
 }
 
 #[tauri::command]
