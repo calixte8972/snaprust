@@ -13,6 +13,10 @@ const MAX_SCROLL_IMAGE_HEIGHT: u32 = 16_000;
 const MAX_SCROLL_IMAGE_PIXELS: u64 = 16_000_000;
 const DUPLICATE_SCORE: f64 = 2.0;
 const MAX_OVERLAP_SCORE: f64 = 28.0;
+const FIXED_ROW_SAME_SCREEN_SCORE: f64 = 6.0;
+const FIXED_ROW_ALIGNED_SCORE: f64 = 10.0;
+const FIXED_ROW_MIN_RUN: u32 = 2;
+const FIXED_ROW_SEARCH_MARGIN: u32 = 128;
 
 pub(super) struct ScrollCaptureOutput {
     pub image: RgbaImage,
@@ -70,6 +74,8 @@ pub(super) fn capture_scrolling_region(
     let mut previous = super::capture::capture_screen_region(x, y, width, height)?;
     let mut stitched = previous.clone();
     let mut segments = 1;
+    let mut document_offset = 0_u32;
+    let mut last_fixed_band = None;
     let wheel_lparam = pack_screen_point(center_x, center_y);
 
     let mut scroll_steps = 0_usize;
@@ -117,8 +123,23 @@ pub(super) fn capture_scrolling_region(
             if u64::from(stitched.width()) * u64::from(next_height) > MAX_SCROLL_IMAGE_PIXELS {
                 break;
             }
+            let fixed_band = find_bottom_fixed_band(&previous, &next, offset);
+            if let Some((start_y, end_y)) = fixed_band {
+                patch_fixed_rows(
+                    &mut stitched,
+                    &next,
+                    document_offset,
+                    offset,
+                    start_y,
+                    end_y,
+                )?;
+            }
             stitched = append_scrolled_frame(stitched, &next, offset)?;
             previous = next;
+            document_offset = document_offset
+                .checked_add(offset)
+                .ok_or_else(|| "滚动截图文档偏移溢出".to_owned())?;
+            last_fixed_band = fixed_band;
             segments += 1;
         }
 
@@ -145,7 +166,30 @@ pub(super) fn capture_scrolling_region(
         };
         thread::sleep(Duration::from_millis(12));
     }
-    capture_result
+    let capture_result = capture_result?;
+    let image = if let Some((start_y, _)) = last_fixed_band {
+        let visible_height = document_offset
+            .checked_add(start_y)
+            .filter(|height| *height > 0 && *height < capture_result.image.height());
+        if let Some(visible_height) = visible_height {
+            image::imageops::crop_imm(
+                &capture_result.image,
+                0,
+                0,
+                capture_result.image.width(),
+                visible_height,
+            )
+            .to_image()
+        } else {
+            capture_result.image
+        }
+    } else {
+        capture_result.image
+    };
+    Ok(ScrollCaptureOutput {
+        image,
+        segments: capture_result.segments,
+    })
 }
 
 #[cfg(windows)]
@@ -307,6 +351,102 @@ fn image_band_difference(
     (samples > 0).then_some(difference as f64 / samples as f64)
 }
 
+fn find_bottom_fixed_band(
+    previous: &RgbaImage,
+    next: &RgbaImage,
+    offset: u32,
+) -> Option<(u32, u32)> {
+    if previous.dimensions() != next.dimensions() || offset == 0 || offset >= previous.height() {
+        return None;
+    }
+    let height = previous.height();
+    let scan_start = height
+        .saturating_sub(offset)
+        .saturating_sub(FIXED_ROW_SEARCH_MARGIN);
+    let mut run_start = None;
+    for y in scan_start..height {
+        let same_screen = row_difference(previous, next, y, y);
+        let aligned = if y >= offset {
+            row_difference(previous, next, y, y - offset)
+        } else {
+            None
+        };
+        let is_fixed = same_screen.is_some_and(|same| same <= FIXED_ROW_SAME_SCREEN_SCORE)
+            && aligned.is_some_and(|score| score >= FIXED_ROW_ALIGNED_SCORE);
+        if is_fixed {
+            run_start.get_or_insert(y);
+        } else {
+            run_start = None;
+        }
+    }
+    if let Some(start) = run_start
+        && height.saturating_sub(start) >= FIXED_ROW_MIN_RUN
+    {
+        return Some((start, height));
+    }
+    None
+}
+
+fn row_difference(
+    previous: &RgbaImage,
+    next: &RgbaImage,
+    previous_y: u32,
+    next_y: u32,
+) -> Option<f64> {
+    if previous.width() != next.width()
+        || previous_y >= previous.height()
+        || next_y >= next.height()
+    {
+        return None;
+    }
+    let width = previous.width();
+    let x_step = ((width / 128).max(1)) as usize;
+    let mut difference = 0_u64;
+    let mut samples = 0_u64;
+    for x in (0..width).step_by(x_step) {
+        let left = previous.get_pixel(x, previous_y).0;
+        let right = next.get_pixel(x, next_y).0;
+        difference += u64::from(left[0].abs_diff(right[0]));
+        difference += u64::from(left[1].abs_diff(right[1]));
+        difference += u64::from(left[2].abs_diff(right[2]));
+        samples += 3;
+    }
+    (samples > 0).then_some(difference as f64 / samples as f64)
+}
+
+fn patch_fixed_rows(
+    stitched: &mut RgbaImage,
+    next: &RgbaImage,
+    document_offset: u32,
+    offset: u32,
+    start_y: u32,
+    end_y: u32,
+) -> Result<(), String> {
+    if start_y >= end_y || end_y > next.height() || start_y < offset {
+        return Ok(());
+    }
+    let source_start = start_y - offset;
+    let row_count = end_y - start_y;
+    if source_start
+        .checked_add(row_count)
+        .is_none_or(|end| end > next.height())
+        || document_offset
+            .checked_add(end_y)
+            .is_none_or(|end| end > stitched.height())
+    {
+        return Err("滚动截图固定元素回填范围无效".to_owned());
+    }
+    for (target_y, source_y) in (start_y..end_y)
+        .map(|y| document_offset + y)
+        .zip(source_start..source_start + row_count)
+    {
+        for x in 0..next.width() {
+            stitched.put_pixel(x, target_y, *next.get_pixel(x, source_y));
+        }
+    }
+    Ok(())
+}
+
 fn append_scrolled_frame(
     stitched: RgbaImage,
     next: &RgbaImage,
@@ -337,7 +477,10 @@ fn append_scrolled_frame(
 mod tests {
     use image::{Rgba, RgbaImage, imageops::crop_imm};
 
-    use super::{append_scrolled_frame, find_vertical_offset, image_difference};
+    use super::{
+        append_scrolled_frame, find_bottom_fixed_band, find_vertical_offset, image_difference,
+        patch_fixed_rows,
+    };
 
     fn document(width: u32, height: u32) -> RgbaImage {
         RgbaImage::from_fn(width, height, |x, y| {
@@ -374,5 +517,36 @@ mod tests {
     fn duplicate_frames_have_zero_difference() {
         let frame = document(80, 120);
         assert_eq!(image_difference(&frame, &frame, 0), Some(0.0));
+    }
+
+    #[test]
+    fn detects_and_repairs_a_fixed_bottom_bar_before_stitching() {
+        let source = document(120, 500);
+        let mut first = crop_imm(&source, 0, 0, 120, 200).to_image();
+        let mut second = crop_imm(&source, 0, 120, 120, 200).to_image();
+        for frame in [&mut first, &mut second] {
+            for y in 190..200 {
+                for x in 0..120 {
+                    frame.put_pixel(x, y, Rgba([238, 216, 170, 255]));
+                }
+            }
+        }
+
+        let band = find_bottom_fixed_band(&first, &second, 120).unwrap();
+        assert_eq!(band, (190, 200));
+        let mut stitched = first.clone();
+        patch_fixed_rows(&mut stitched, &second, 0, 120, band.0, band.1).unwrap();
+        assert_eq!(
+            crop_imm(&stitched, 0, 190, 120, 10).to_image(),
+            crop_imm(&source, 0, 190, 120, 10).to_image()
+        );
+    }
+
+    #[test]
+    fn does_not_mark_a_normal_scrolling_document_as_fixed() {
+        let source = document(120, 500);
+        let first = crop_imm(&source, 0, 0, 120, 200).to_image();
+        let second = crop_imm(&source, 0, 120, 120, 200).to_image();
+        assert_eq!(find_bottom_fixed_band(&first, &second, 120), None);
     }
 }
