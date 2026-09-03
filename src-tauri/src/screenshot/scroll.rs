@@ -1,4 +1,4 @@
-//! Automatic scrolling capture and overlap-based vertical stitching.
+//! Manual scrolling capture and overlap-based vertical stitching.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,13 +15,23 @@ const DUPLICATE_SCORE: f64 = 2.0;
 const MAX_OVERLAP_SCORE: f64 = 28.0;
 const FIXED_ROW_SAME_SCREEN_SCORE: f64 = 6.0;
 const FIXED_ROW_ALIGNED_SCORE: f64 = 10.0;
-const FIXED_ROW_MIN_RUN: u32 = 2;
+const FIXED_ROW_MIN_RUN: u32 = 8;
 const FIXED_ROW_SEARCH_MARGIN: u32 = 128;
 const MANUAL_SCROLL_POLL_INTERVAL_MS: u64 = 75;
+const ROW_MATCH_SAMPLES: u32 = 96;
+const MIN_ROW_MATCH_VOTES: u32 = 5;
+const MIN_SCROLL_OVERLAP_ROWS: u32 = 32;
 
 pub(super) struct ScrollCaptureOutput {
     pub image: RgbaImage,
     pub segments: usize,
+}
+
+#[cfg(windows)]
+enum StitchFrameResult {
+    Accepted,
+    NoChange,
+    LimitReached,
 }
 
 #[cfg(windows)]
@@ -71,7 +81,7 @@ pub(super) fn capture_scrolling_region(
 
     let mut previous = super::capture::capture_screen_region(x, y, width, height)?;
     let mut stitched = previous.clone();
-    let mut segments = 1;
+    let mut segments: usize = 1;
     let mut document_offset = 0_u32;
     let mut last_fixed_band = None;
     let mut pending = None;
@@ -83,6 +93,32 @@ pub(super) fn capture_scrolling_region(
                 return Err("长截图已取消".to_owned());
             }
             if unsafe { GetAsyncKeyState(i32::from(VK_RETURN.0)) } < 0 {
+                // Enter can arrive before the next 75 ms poll. Take one fresh
+                // frame here so the last wheel movement is not left out.
+                let candidate = if let Some(candidate) = pending.take() {
+                    Some(candidate)
+                } else {
+                    thread::sleep(Duration::from_millis(MANUAL_SCROLL_POLL_INTERVAL_MS));
+                    let current = super::capture::capture_screen_region(x, y, width, height)?;
+                    (image_difference(&previous, &current, 0).unwrap_or(f64::MAX) > DUPLICATE_SCORE)
+                        .then_some(current)
+                };
+                if let Some(candidate) = candidate {
+                    let final_frame =
+                        wait_for_stable_manual_frame(x, y, width, height, candidate, cancelled)?;
+                    match stitch_manual_frame(
+                        &mut previous,
+                        &mut stitched,
+                        &mut document_offset,
+                        &mut last_fixed_band,
+                        final_frame,
+                    )? {
+                        StitchFrameResult::Accepted => {
+                            segments = segments.saturating_add(1);
+                        }
+                        StitchFrameResult::NoChange | StitchFrameResult::LimitReached => {}
+                    }
+                }
                 break;
             }
             if segments >= MAX_SCROLL_SEGMENTS {
@@ -99,47 +135,19 @@ pub(super) fn capture_scrolling_region(
                     pending = Some(current);
                     continue;
                 }
-                let next = current;
-                if image_difference(&previous, &next, 0).unwrap_or(f64::MAX) <= DUPLICATE_SCORE {
-                    continue;
+                match stitch_manual_frame(
+                    &mut previous,
+                    &mut stitched,
+                    &mut document_offset,
+                    &mut last_fixed_band,
+                    current,
+                )? {
+                    StitchFrameResult::Accepted => {
+                        segments = segments.saturating_add(1);
+                    }
+                    StitchFrameResult::NoChange => {}
+                    StitchFrameResult::LimitReached => break,
                 }
-
-                let Some((offset, score)) = find_vertical_offset(&previous, &next) else {
-                    return Err("未找到相邻画面的重叠区域；请放慢滚动速度并保持纵向滚动".to_owned());
-                };
-                if score > MAX_OVERLAP_SCORE {
-                    return Err(
-                        "滚动画面变化过大，无法可靠拼接；请一次滚动少一些并避开动画区域".to_owned(),
-                    );
-                }
-                let next_height = stitched
-                    .height()
-                    .checked_add(offset)
-                    .ok_or_else(|| "滚动截图高度溢出".to_owned())?;
-                if next_height > MAX_SCROLL_IMAGE_HEIGHT {
-                    break;
-                }
-                if u64::from(stitched.width()) * u64::from(next_height) > MAX_SCROLL_IMAGE_PIXELS {
-                    break;
-                }
-                let fixed_band = find_bottom_fixed_band(&previous, &next, offset);
-                if let Some((start_y, end_y)) = fixed_band {
-                    patch_fixed_rows(
-                        &mut stitched,
-                        &next,
-                        document_offset,
-                        offset,
-                        start_y,
-                        end_y,
-                    )?;
-                }
-                stitched = append_scrolled_frame(stitched, &next, offset)?;
-                previous = next;
-                document_offset = document_offset
-                    .checked_add(offset)
-                    .ok_or_else(|| "滚动截图文档偏移溢出".to_owned())?;
-                last_fixed_band = fixed_band;
-                segments += 1;
             } else if image_difference(&previous, &current, 0).unwrap_or(f64::MAX) > DUPLICATE_SCORE
             {
                 pending = Some(current);
@@ -180,6 +188,74 @@ pub(super) fn capture_scrolling_region(
     })
 }
 
+#[cfg(windows)]
+fn wait_for_stable_manual_frame(
+    x: i32,
+    y: i32,
+    width: u32,
+    height: u32,
+    initial: RgbaImage,
+    cancelled: &AtomicBool,
+) -> Result<RgbaImage, String> {
+    use std::{thread, time::Duration};
+
+    let mut candidate = initial;
+    for _ in 0..4 {
+        if cancelled.load(Ordering::Acquire) {
+            return Err("长截图已取消".to_owned());
+        }
+        thread::sleep(Duration::from_millis(MANUAL_SCROLL_POLL_INTERVAL_MS));
+        let current = super::capture::capture_screen_region(x, y, width, height)?;
+        if image_difference(&candidate, &current, 0).unwrap_or(f64::MAX) <= DUPLICATE_SCORE {
+            return Ok(current);
+        }
+        candidate = current;
+    }
+    Ok(candidate)
+}
+
+#[cfg(windows)]
+fn stitch_manual_frame(
+    previous: &mut RgbaImage,
+    stitched: &mut RgbaImage,
+    document_offset: &mut u32,
+    last_fixed_band: &mut Option<(u32, u32)>,
+    next: RgbaImage,
+) -> Result<StitchFrameResult, String> {
+    if image_difference(previous, &next, 0).unwrap_or(f64::MAX) <= DUPLICATE_SCORE {
+        return Ok(StitchFrameResult::NoChange);
+    }
+
+    let Some((offset, score)) = find_vertical_offset(previous, &next) else {
+        return Err("未找到相邻画面的重叠区域；请放慢滚动速度并保持纵向滚动".to_owned());
+    };
+    if score > MAX_OVERLAP_SCORE {
+        return Err("滚动画面变化过大，无法可靠拼接；请一次滚动少一些并避开动画区域".to_owned());
+    }
+    let next_height = stitched
+        .height()
+        .checked_add(offset)
+        .ok_or_else(|| "滚动截图高度溢出".to_owned())?;
+    if next_height > MAX_SCROLL_IMAGE_HEIGHT
+        || u64::from(stitched.width()) * u64::from(next_height) > MAX_SCROLL_IMAGE_PIXELS
+    {
+        return Ok(StitchFrameResult::LimitReached);
+    }
+    let fixed_band = find_bottom_fixed_band(previous, &next, offset);
+    let seam = find_seam(previous, &next, offset);
+    if let Some((start_y, end_y)) = fixed_band {
+        patch_fixed_rows(stitched, &next, *document_offset, offset, start_y, end_y)?;
+    }
+    let old_stitched = std::mem::replace(stitched, RgbaImage::new(0, 0));
+    *stitched = append_scrolled_frame_at_seam(old_stitched, &next, offset, seam)?;
+    *previous = next;
+    *document_offset = document_offset
+        .checked_add(offset)
+        .ok_or_else(|| "滚动截图文档偏移溢出".to_owned())?;
+    *last_fixed_band = fixed_band;
+    Ok(StitchFrameResult::Accepted)
+}
+
 #[cfg(not(windows))]
 pub(super) fn capture_scrolling_region(
     _x: i32,
@@ -192,43 +268,126 @@ pub(super) fn capture_scrolling_region(
 }
 
 fn find_vertical_offset(previous: &RgbaImage, next: &RgbaImage) -> Option<(u32, f64)> {
-    if previous.dimensions() != next.dimensions() || previous.height() < 16 {
+    if previous.dimensions() != next.dimensions()
+        || previous.height() < MIN_SCROLL_OVERLAP_ROWS.saturating_add(8)
+    {
         return None;
     }
     let height = previous.height();
-    let minimum_offset = (height / 20).max(4);
-    let maximum_offset = (height * 4 / 5).max(minimum_offset);
-    let coarse_step = (height / 160).max(2);
-    let mut best: Option<(u32, f64)> = None;
-
-    let mut offset = minimum_offset;
-    while offset <= maximum_offset {
-        if let Some(score) = image_difference(previous, next, offset)
-            && best.is_none_or(|(_, best_score)| score < best_score)
-        {
-            best = Some((offset, score));
-        }
-        offset = offset.saturating_add(coarse_step);
-        if offset == u32::MAX {
-            break;
-        }
-    }
-
-    let (coarse_offset, _) = best?;
-    let refine_start = coarse_offset
-        .saturating_sub(coarse_step)
+    let minimum_offset = (height / 40).max(4);
+    let maximum_offset = height
+        .saturating_sub(MIN_SCROLL_OVERLAP_ROWS)
         .max(minimum_offset);
-    let refine_end = coarse_offset
-        .saturating_add(coarse_step)
-        .min(maximum_offset);
-    for candidate in refine_start..=refine_end {
-        if let Some(score) = image_difference(previous, next, candidate)
-            && best.is_none_or(|(_, best_score)| score < best_score)
+    let width = previous.width();
+    let horizontal_margin = (width / 20).max(8).min(width / 3);
+    let left = horizontal_margin;
+    let right = width.saturating_sub(horizontal_margin);
+    if right <= left {
+        return None;
+    }
+
+    // Build compact row signatures once, then vote on the vertical offset.
+    // This is much less sensitive to blank rows and repeated separators than
+    // choosing the lowest score for one large rectangular overlap.
+    let sample_count = usize::try_from((right - left).min(ROW_MATCH_SAMPLES)).ok()?;
+    if sample_count == 0 {
+        return None;
+    }
+    let previous_rows = build_row_signatures(previous, left, right, sample_count);
+    let next_rows = build_row_signatures(next, left, right, sample_count);
+    let max_offset = usize::try_from(maximum_offset).ok()?;
+    let min_offset = usize::try_from(minimum_offset).ok()?;
+    let mut votes = vec![0_u32; max_offset.saturating_add(1)];
+    let mut errors = vec![0_u64; max_offset.saturating_add(1)];
+    let row_match_threshold = u64::try_from(sample_count)
+        .ok()?
+        .saturating_mul(3)
+        .saturating_mul(4);
+
+    for (previous_y, previous_row) in previous_rows.iter().enumerate().skip(min_offset) {
+        let first_next_y = previous_y.saturating_sub(max_offset);
+        let last_next_y = previous_y.saturating_sub(min_offset);
+        if first_next_y > last_next_y {
+            continue;
+        }
+        let mut best_next_y = 0_usize;
+        let mut best_error = u64::MAX;
+        for (next_y, next_row) in next_rows
+            .iter()
+            .enumerate()
+            .skip(first_next_y)
+            .take(last_next_y - first_next_y + 1)
         {
-            best = Some((candidate, score));
+            let error = row_signature_difference(previous_row, next_row);
+            if error < best_error {
+                best_error = error;
+                best_next_y = next_y;
+            }
+        }
+        if best_error <= row_match_threshold {
+            let offset = previous_y - best_next_y;
+            votes[offset] = votes[offset].saturating_add(1);
+            errors[offset] = errors[offset].saturating_add(best_error);
         }
     }
-    best
+
+    let minimum_votes = (height / 80).max(MIN_ROW_MATCH_VOTES);
+    let mut best: Option<(usize, u32, u64)> = None;
+    for offset in min_offset..=max_offset {
+        let vote_count = votes[offset];
+        if vote_count < minimum_votes {
+            continue;
+        }
+        let total_error = errors[offset];
+        if best.is_none_or(|(_, best_votes, best_error)| {
+            vote_count > best_votes || (vote_count == best_votes && total_error < best_error)
+        }) {
+            best = Some((offset, vote_count, total_error));
+        }
+    }
+
+    let (offset, _, _) = best?;
+    let offset = u32::try_from(offset).ok()?;
+    let score = image_difference(previous, next, offset)?;
+    Some((offset, score))
+}
+
+fn build_row_signatures(
+    image: &RgbaImage,
+    left: u32,
+    right: u32,
+    sample_count: usize,
+) -> Vec<Vec<[u8; 3]>> {
+    let usable_width = right.saturating_sub(left);
+    (0..image.height())
+        .map(|y| {
+            (0..sample_count)
+                .map(|sample| {
+                    let x = if sample_count <= 1 {
+                        left
+                    } else {
+                        let position = (u64::try_from(sample).unwrap_or(0)
+                            * u64::from(usable_width.saturating_sub(1)))
+                            / u64::try_from(sample_count - 1).unwrap_or(1);
+                        left.saturating_add(u32::try_from(position).unwrap_or(u32::MAX))
+                    };
+                    let pixel = image.get_pixel(x.min(right.saturating_sub(1)), y).0;
+                    [pixel[0], pixel[1], pixel[2]]
+                })
+                .collect()
+        })
+        .collect()
+}
+
+fn row_signature_difference(left: &[[u8; 3]], right: &[[u8; 3]]) -> u64 {
+    left.iter()
+        .zip(right)
+        .map(|(left, right)| {
+            u64::from(left[0].abs_diff(right[0]))
+                + u64::from(left[1].abs_diff(right[1]))
+                + u64::from(left[2].abs_diff(right[2]))
+        })
+        .sum()
 }
 
 /// Compares `previous[offset..]` with `next[..height-offset]`.
@@ -395,28 +554,69 @@ fn patch_fixed_rows(
     Ok(())
 }
 
-fn append_scrolled_frame(
+fn find_seam(previous: &RgbaImage, next: &RgbaImage, offset: u32) -> u32 {
+    if previous.dimensions() != next.dimensions() || offset >= next.height() {
+        return next.height().saturating_sub(offset);
+    }
+    let overlap_height = next.height() - offset;
+    if overlap_height < 4 {
+        return overlap_height;
+    }
+    let margin = (overlap_height / 10).min(48);
+    let start = margin.max(1);
+    let end = overlap_height.saturating_sub(margin).max(start + 1);
+    let mut best_row = start;
+    let mut best_score = f64::MAX;
+    for row in start..end.min(overlap_height) {
+        if let Some(score) = row_difference(previous, next, row + offset, row)
+            && score < best_score
+        {
+            best_score = score;
+            best_row = row;
+        }
+    }
+    best_row
+}
+
+fn append_scrolled_frame_at_seam(
     stitched: RgbaImage,
     next: &RgbaImage,
     offset: u32,
+    seam: u32,
 ) -> Result<RgbaImage, String> {
-    if stitched.width() != next.width() || offset == 0 || offset > next.height() {
+    if stitched.width() != next.width()
+        || offset == 0
+        || offset > next.height()
+        || seam > next.height() - offset
+    {
         return Err("滚动截图拼接尺寸无效".to_owned());
     }
-    let height = stitched
+    let old_overlap_after_seam = next.height() - offset - seam;
+    let kept_height = stitched
         .height()
-        .checked_add(offset)
+        .checked_sub(old_overlap_after_seam)
+        .ok_or_else(|| "滚动截图重叠区域超出已拼接图像".to_owned())?;
+    let height = kept_height
+        .checked_add(next.height() - seam)
         .ok_or_else(|| "滚动截图拼接高度溢出".to_owned())?;
     let width = stitched.width();
     let row_bytes = usize::try_from(width)
         .ok()
         .and_then(|value| value.checked_mul(4))
         .ok_or_else(|| "滚动截图行宽溢出".to_owned())?;
-    let first_new_row = usize::try_from(next.height() - offset)
+    let kept_bytes = usize::try_from(kept_height)
+        .ok()
+        .and_then(|value| value.checked_mul(row_bytes))
+        .ok_or_else(|| "滚动截图保留区域溢出".to_owned())?;
+    let first_new_row = usize::try_from(seam)
         .ok()
         .and_then(|value| value.checked_mul(row_bytes))
         .ok_or_else(|| "滚动截图像素偏移溢出".to_owned())?;
     let mut pixels = stitched.into_raw();
+    if kept_bytes > pixels.len() || first_new_row > next.as_raw().len() {
+        return Err("滚动截图像素范围无效".to_owned());
+    }
+    pixels.truncate(kept_bytes);
     pixels.extend_from_slice(&next.as_raw()[first_new_row..]);
     RgbaImage::from_raw(width, height, pixels).ok_or_else(|| "无法创建滚动截图拼接图像".to_owned())
 }
@@ -426,8 +626,8 @@ mod tests {
     use image::{Rgba, RgbaImage, imageops::crop_imm};
 
     use super::{
-        append_scrolled_frame, find_bottom_fixed_band, find_vertical_offset, image_difference,
-        patch_fixed_rows,
+        append_scrolled_frame_at_seam, find_bottom_fixed_band, find_vertical_offset,
+        image_difference, patch_fixed_rows,
     };
 
     fn document(width: u32, height: u32) -> RgbaImage {
@@ -456,9 +656,29 @@ mod tests {
         let source = document(120, 500);
         let first = crop_imm(&source, 0, 0, 120, 200).to_image();
         let second = crop_imm(&source, 0, 120, 120, 200).to_image();
-        let stitched = append_scrolled_frame(first, &second, 120).unwrap();
+        let stitched = append_scrolled_frame_at_seam(first, &second, 120, 80).unwrap();
         assert_eq!(stitched.dimensions(), (120, 320));
         assert_eq!(stitched, crop_imm(&source, 0, 0, 120, 320).to_image());
+    }
+
+    #[test]
+    fn appends_using_a_seam_without_dropping_or_duplicating_rows() {
+        let source = document(120, 500);
+        let first = crop_imm(&source, 0, 0, 120, 200).to_image();
+        let second = crop_imm(&source, 0, 120, 120, 200).to_image();
+        let stitched = append_scrolled_frame_at_seam(first, &second, 120, 40).unwrap();
+        assert_eq!(stitched.dimensions(), (120, 320));
+        assert_eq!(stitched, crop_imm(&source, 0, 0, 120, 320).to_image());
+    }
+
+    #[test]
+    fn finds_a_large_manual_scroll_when_a_small_overlap_remains() {
+        let source = document(120, 500);
+        let first = crop_imm(&source, 0, 0, 120, 200).to_image();
+        let second = crop_imm(&source, 0, 160, 120, 200).to_image();
+        let (offset, score) = find_vertical_offset(&first, &second).unwrap();
+        assert_eq!(offset, 160);
+        assert_eq!(score, 0.0);
     }
 
     #[test]
