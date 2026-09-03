@@ -1463,7 +1463,7 @@ async function captureLongScreenshot(): Promise<void> {
   annotationTranslate.disabled = true;
   annotationPin.disabled = true;
   annotationFrameSelect.disabled = true;
-  annotationStatus.textContent = "正在隐藏编辑器并自动滚动拼接；按 Esc 可取消，请暂时不要操作目标窗口…";
+  annotationStatus.textContent = "请手动向下滚动目标窗口；程序会自动采集，按 Enter 完成，Esc 取消…";
   const version = captureSessionVersion;
   let overlayHidden = false;
 

@@ -17,6 +17,7 @@ const FIXED_ROW_SAME_SCREEN_SCORE: f64 = 6.0;
 const FIXED_ROW_ALIGNED_SCORE: f64 = 10.0;
 const FIXED_ROW_MIN_RUN: u32 = 2;
 const FIXED_ROW_SEARCH_MARGIN: u32 = 128;
+const MANUAL_SCROLL_POLL_INTERVAL_MS: u64 = 75;
 
 pub(super) struct ScrollCaptureOutput {
     pub image: RgbaImage,
@@ -36,11 +37,8 @@ pub(super) fn capture_scrolling_region(
     use windows::Win32::{
         Foundation::POINT,
         UI::{
-            Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE},
-            WindowsAndMessaging::{
-                GA_ROOT, GetAncestor, PostMessageW, SetForegroundWindow, WM_MOUSEWHEEL,
-                WindowFromPoint,
-            },
+            Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE, VK_RETURN},
+            WindowsAndMessaging::{GA_ROOT, GetAncestor, SetForegroundWindow, WindowFromPoint},
         },
     };
 
@@ -76,96 +74,86 @@ pub(super) fn capture_scrolling_region(
     let mut segments = 1;
     let mut document_offset = 0_u32;
     let mut last_fixed_band = None;
-    let wheel_lparam = pack_screen_point(center_x, center_y);
-
-    let mut scroll_steps = 0_usize;
+    let mut pending = None;
     let capture_result = (|| {
-        for _ in 1..MAX_SCROLL_SEGMENTS {
+        loop {
             if cancelled.load(Ordering::Acquire)
                 || unsafe { GetAsyncKeyState(i32::from(VK_ESCAPE.0)) } < 0
             {
                 return Err("长截图已取消".to_owned());
             }
-            let wheel_wparam = pack_wheel_delta(-480);
-            // SAFETY: target was returned by WindowFromPoint. The message contains
-            // only ordinary mouse-wheel coordinates and no borrowed pointers.
-            unsafe { PostMessageW(Some(target), WM_MOUSEWHEEL, wheel_wparam, wheel_lparam) }
-                .map_err(|error| format!("无法向目标窗口发送滚轮消息：{error}"))?;
-            scroll_steps += 1;
-            let next = capture_stable_region(x, y, width, height, cancelled)?;
-            if image_difference(&previous, &next, 0).unwrap_or(f64::MAX) <= DUPLICATE_SCORE {
+            if unsafe { GetAsyncKeyState(i32::from(VK_RETURN.0)) } < 0 {
+                break;
+            }
+            if segments >= MAX_SCROLL_SEGMENTS {
                 break;
             }
 
-            let Some((offset, score)) = find_vertical_offset(&previous, &next) else {
-                if segments == 1 {
+            // The user owns the scroll wheel. We poll the selected region and
+            // wait for two equal frames before accepting a manual scroll, which
+            // avoids stitching an intermediate smooth-scroll animation frame.
+            thread::sleep(Duration::from_millis(MANUAL_SCROLL_POLL_INTERVAL_MS));
+            let current = super::capture::capture_screen_region(x, y, width, height)?;
+            if let Some(candidate) = pending.take() {
+                if image_difference(&candidate, &current, 0).unwrap_or(f64::MAX) > DUPLICATE_SCORE {
+                    pending = Some(current);
+                    continue;
+                }
+                let next = current;
+                if image_difference(&previous, &next, 0).unwrap_or(f64::MAX) <= DUPLICATE_SCORE {
+                    continue;
+                }
+
+                let Some((offset, score)) = find_vertical_offset(&previous, &next) else {
+                    return Err("未找到相邻画面的重叠区域；请放慢滚动速度并保持纵向滚动".to_owned());
+                };
+                if score > MAX_OVERLAP_SCORE {
                     return Err(
-                        "未找到相邻画面的重叠区域；请缩小滚动速度或选择静态内容区域".to_owned()
+                        "滚动画面变化过大，无法可靠拼接；请一次滚动少一些并避开动画区域".to_owned(),
                     );
                 }
-                break;
-            };
-            if score > MAX_OVERLAP_SCORE {
-                if segments == 1 {
-                    return Err(
-                        "滚动画面变化过大，无法可靠拼接；请避开视频、动画或悬浮内容".to_owned()
-                    );
+                let next_height = stitched
+                    .height()
+                    .checked_add(offset)
+                    .ok_or_else(|| "滚动截图高度溢出".to_owned())?;
+                if next_height > MAX_SCROLL_IMAGE_HEIGHT {
+                    break;
                 }
-                break;
+                if u64::from(stitched.width()) * u64::from(next_height) > MAX_SCROLL_IMAGE_PIXELS {
+                    break;
+                }
+                let fixed_band = find_bottom_fixed_band(&previous, &next, offset);
+                if let Some((start_y, end_y)) = fixed_band {
+                    patch_fixed_rows(
+                        &mut stitched,
+                        &next,
+                        document_offset,
+                        offset,
+                        start_y,
+                        end_y,
+                    )?;
+                }
+                stitched = append_scrolled_frame(stitched, &next, offset)?;
+                previous = next;
+                document_offset = document_offset
+                    .checked_add(offset)
+                    .ok_or_else(|| "滚动截图文档偏移溢出".to_owned())?;
+                last_fixed_band = fixed_band;
+                segments += 1;
+            } else if image_difference(&previous, &current, 0).unwrap_or(f64::MAX) > DUPLICATE_SCORE
+            {
+                pending = Some(current);
             }
-            let next_height = stitched
-                .height()
-                .checked_add(offset)
-                .ok_or_else(|| "滚动截图高度溢出".to_owned())?;
-            if next_height > MAX_SCROLL_IMAGE_HEIGHT {
-                break;
-            }
-            if u64::from(stitched.width()) * u64::from(next_height) > MAX_SCROLL_IMAGE_PIXELS {
-                break;
-            }
-            let fixed_band = find_bottom_fixed_band(&previous, &next, offset);
-            if let Some((start_y, end_y)) = fixed_band {
-                patch_fixed_rows(
-                    &mut stitched,
-                    &next,
-                    document_offset,
-                    offset,
-                    start_y,
-                    end_y,
-                )?;
-            }
-            stitched = append_scrolled_frame(stitched, &next, offset)?;
-            previous = next;
-            document_offset = document_offset
-                .checked_add(offset)
-                .ok_or_else(|| "滚动截图文档偏移溢出".to_owned())?;
-            last_fixed_band = fixed_band;
-            segments += 1;
         }
 
         if segments == 1 {
-            return Err("目标窗口没有发生可识别的滚动，请确认选区位于可滚动内容上".to_owned());
+            return Err("尚未记录滚动内容，请先向下滚动至少一次，再按 Enter 完成".to_owned());
         }
         Ok(ScrollCaptureOutput {
             image: stitched,
             segments,
         })
     })();
-
-    // Keep the target application close to its original scroll position even
-    // when stitching fails or the user cancels. Wheel messages are symmetric,
-    // so this is best-effort for applications with custom scroll acceleration.
-    for _ in 0..scroll_steps {
-        let _ = unsafe {
-            PostMessageW(
-                Some(target),
-                WM_MOUSEWHEEL,
-                pack_wheel_delta(480),
-                wheel_lparam,
-            )
-        };
-        thread::sleep(Duration::from_millis(12));
-    }
     let capture_result = capture_result?;
     let image = if let Some((start_y, _)) = last_fixed_band {
         let visible_height = document_offset
@@ -192,17 +180,6 @@ pub(super) fn capture_scrolling_region(
     })
 }
 
-#[cfg(windows)]
-fn pack_wheel_delta(delta: i16) -> windows::Win32::Foundation::WPARAM {
-    windows::Win32::Foundation::WPARAM(usize::from(delta as u16) << 16)
-}
-
-#[cfg(windows)]
-fn pack_screen_point(x: i32, y: i32) -> windows::Win32::Foundation::LPARAM {
-    let packed = u32::from(x as u16) | (u32::from(y as u16) << 16);
-    windows::Win32::Foundation::LPARAM(packed as isize)
-}
-
 #[cfg(not(windows))]
 pub(super) fn capture_scrolling_region(
     _x: i32,
@@ -212,35 +189,6 @@ pub(super) fn capture_scrolling_region(
     _cancelled: &AtomicBool,
 ) -> Result<ScrollCaptureOutput, String> {
     Err("滚动截图目前仅支持 Windows".to_owned())
-}
-
-#[cfg(windows)]
-fn capture_stable_region(
-    x: i32,
-    y: i32,
-    width: u32,
-    height: u32,
-    cancelled: &AtomicBool,
-) -> Result<RgbaImage, String> {
-    use std::{thread, time::Duration};
-    use windows::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_ESCAPE};
-
-    thread::sleep(Duration::from_millis(120));
-    let mut previous = super::capture::capture_screen_region(x, y, width, height)?;
-    for _ in 0..7 {
-        if cancelled.load(Ordering::Acquire)
-            || unsafe { GetAsyncKeyState(i32::from(VK_ESCAPE.0)) } < 0
-        {
-            return Err("长截图已取消".to_owned());
-        }
-        thread::sleep(Duration::from_millis(90));
-        let current = super::capture::capture_screen_region(x, y, width, height)?;
-        if image_difference(&previous, &current, 0).unwrap_or(f64::MAX) <= DUPLICATE_SCORE {
-            return Ok(current);
-        }
-        previous = current;
-    }
-    Ok(previous)
 }
 
 fn find_vertical_offset(previous: &RgbaImage, next: &RgbaImage) -> Option<(u32, f64)> {
