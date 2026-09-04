@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use image::RgbaImage;
 
-const MAX_SCROLL_SEGMENTS: usize = 24;
+const MAX_SCROLL_SEGMENTS: usize = 128;
 // WebView2 canvas allocations are substantially more expensive than the Rust
 // RGBA buffer because the editor keeps a source image and two drawing layers.
 // Keep long captures below a predictable memory ceiling until the editor uses
@@ -18,6 +18,8 @@ const FIXED_ROW_ALIGNED_SCORE: f64 = 10.0;
 const FIXED_ROW_MIN_RUN: u32 = 8;
 const FIXED_ROW_SEARCH_MARGIN: u32 = 128;
 const MANUAL_SCROLL_POLL_INTERVAL_MS: u64 = 75;
+const MAX_STABLE_FRAME_POLLS: usize = 8;
+const MAX_STITCH_RETRIES: usize = 6;
 const ROW_MATCH_SAMPLES: u32 = 96;
 const MIN_ROW_MATCH_VOTES: u32 = 5;
 const MIN_SCROLL_OVERLAP_ROWS: u32 = 32;
@@ -31,6 +33,7 @@ pub(super) struct ScrollCaptureOutput {
 enum StitchFrameResult {
     Accepted,
     NoChange,
+    Retry(RgbaImage),
     LimitReached,
 }
 
@@ -85,6 +88,7 @@ pub(super) fn capture_scrolling_region(
     let mut document_offset = 0_u32;
     let mut last_fixed_band = None;
     let mut pending = None;
+    let mut stitch_retries = 0_usize;
     let capture_result = (|| {
         loop {
             if cancelled.load(Ordering::Acquire)
@@ -100,8 +104,7 @@ pub(super) fn capture_scrolling_region(
                 } else {
                     thread::sleep(Duration::from_millis(MANUAL_SCROLL_POLL_INTERVAL_MS));
                     let current = super::capture::capture_screen_region(x, y, width, height)?;
-                    (image_difference(&previous, &current, 0).unwrap_or(f64::MAX) > DUPLICATE_SCORE)
-                        .then_some(current)
+                    frame_has_changed(&previous, &current).then_some(current)
                 };
                 if let Some(candidate) = candidate {
                     let final_frame =
@@ -116,13 +119,22 @@ pub(super) fn capture_scrolling_region(
                         StitchFrameResult::Accepted => {
                             segments = segments.saturating_add(1);
                         }
-                        StitchFrameResult::NoChange | StitchFrameResult::LimitReached => {}
+                        StitchFrameResult::NoChange => {}
+                        StitchFrameResult::Retry(_) => {
+                            return Err("最后一帧无法与之前画面对齐；请放慢滚动速度并保留重叠区域"
+                                .to_owned());
+                        }
+                        StitchFrameResult::LimitReached => {
+                            return Err("长截图已达到当前图片尺寸上限，请分段截取".to_owned());
+                        }
                     }
                 }
                 break;
             }
             if segments >= MAX_SCROLL_SEGMENTS {
-                break;
+                return Err(format!(
+                    "长截图已达到当前最多 {MAX_SCROLL_SEGMENTS} 段，请分段截取"
+                ));
             }
 
             // The user owns the scroll wheel. We poll the selected region and
@@ -133,6 +145,7 @@ pub(super) fn capture_scrolling_region(
             if let Some(candidate) = pending.take() {
                 if image_difference(&candidate, &current, 0).unwrap_or(f64::MAX) > DUPLICATE_SCORE {
                     pending = Some(current);
+                    stitch_retries = 0;
                     continue;
                 }
                 match stitch_manual_frame(
@@ -143,13 +156,26 @@ pub(super) fn capture_scrolling_region(
                     current,
                 )? {
                     StitchFrameResult::Accepted => {
+                        stitch_retries = 0;
                         segments = segments.saturating_add(1);
                     }
-                    StitchFrameResult::NoChange => {}
-                    StitchFrameResult::LimitReached => break,
+                    StitchFrameResult::NoChange => {
+                        stitch_retries = 0;
+                    }
+                    StitchFrameResult::Retry(frame) => {
+                        stitch_retries = stitch_retries.saturating_add(1);
+                        if stitch_retries >= MAX_STITCH_RETRIES {
+                            return Err(
+                                "连续多次无法对齐滚动画面；请放慢滚动速度并保留重叠区域".to_owned()
+                            );
+                        }
+                        pending = Some(frame);
+                    }
+                    StitchFrameResult::LimitReached => {
+                        return Err("长截图已达到当前图片尺寸上限，请分段截取".to_owned());
+                    }
                 }
-            } else if image_difference(&previous, &current, 0).unwrap_or(f64::MAX) > DUPLICATE_SCORE
-            {
+            } else if frame_has_changed(&previous, &current) {
                 pending = Some(current);
             }
         }
@@ -200,7 +226,7 @@ fn wait_for_stable_manual_frame(
     use std::{thread, time::Duration};
 
     let mut candidate = initial;
-    for _ in 0..4 {
+    for _ in 0..MAX_STABLE_FRAME_POLLS {
         if cancelled.load(Ordering::Acquire) {
             return Err("长截图已取消".to_owned());
         }
@@ -222,15 +248,15 @@ fn stitch_manual_frame(
     last_fixed_band: &mut Option<(u32, u32)>,
     next: RgbaImage,
 ) -> Result<StitchFrameResult, String> {
-    if image_difference(previous, &next, 0).unwrap_or(f64::MAX) <= DUPLICATE_SCORE {
+    if !frame_has_changed(previous, &next) {
         return Ok(StitchFrameResult::NoChange);
     }
 
     let Some((offset, score)) = find_vertical_offset(previous, &next) else {
-        return Err("未找到相邻画面的重叠区域；请放慢滚动速度并保持纵向滚动".to_owned());
+        return Ok(StitchFrameResult::Retry(next));
     };
     if score > MAX_OVERLAP_SCORE {
-        return Err("滚动画面变化过大，无法可靠拼接；请一次滚动少一些并避开动画区域".to_owned());
+        return Ok(StitchFrameResult::Retry(next));
     }
     let next_height = stitched
         .height()
@@ -274,7 +300,9 @@ fn find_vertical_offset(previous: &RgbaImage, next: &RgbaImage) -> Option<(u32, 
         return None;
     }
     let height = previous.height();
-    let minimum_offset = (height / 40).max(4);
+    // Trackpads and high-resolution wheel settings can move the content by
+    // only a few pixels. Do not discard those frames before matching them.
+    let minimum_offset = 1;
     let maximum_offset = height
         .saturating_sub(MIN_SCROLL_OVERLAP_ROWS)
         .max(minimum_offset);
@@ -346,10 +374,56 @@ fn find_vertical_offset(previous: &RgbaImage, next: &RgbaImage) -> Option<(u32, 
         }
     }
 
-    let (offset, _, _) = best?;
-    let offset = u32::try_from(offset).ok()?;
-    let score = image_difference(previous, next, offset)?;
-    Some((offset, score))
+    if let Some((offset, _, _)) = best {
+        let offset = u32::try_from(offset).ok()?;
+        let score = image_difference(previous, next, offset)?;
+        if score <= MAX_OVERLAP_SCORE {
+            return Some((offset, score));
+        }
+    }
+
+    // Row voting is the primary detector. Keep a compact legacy-style scan as
+    // a recovery path for anti-aliased text, video frames, or pages with too
+    // few distinctive rows to produce enough votes.
+    find_vertical_offset_by_overlap(previous, next, minimum_offset, maximum_offset)
+}
+
+fn find_vertical_offset_by_overlap(
+    previous: &RgbaImage,
+    next: &RgbaImage,
+    minimum_offset: u32,
+    maximum_offset: u32,
+) -> Option<(u32, f64)> {
+    let coarse_step = (previous.height() / 160).max(1);
+    let mut best: Option<(u32, f64)> = None;
+    let mut offset = minimum_offset;
+    while offset <= maximum_offset {
+        if let Some(score) = image_difference(previous, next, offset)
+            && best.is_none_or(|(_, best_score)| score < best_score)
+        {
+            best = Some((offset, score));
+        }
+        offset = offset.saturating_add(coarse_step);
+        if offset == u32::MAX {
+            break;
+        }
+    }
+
+    let (coarse_offset, _) = best?;
+    let refine_start = coarse_offset
+        .saturating_sub(coarse_step)
+        .max(minimum_offset);
+    let refine_end = coarse_offset
+        .saturating_add(coarse_step)
+        .min(maximum_offset);
+    for candidate in refine_start..=refine_end {
+        if let Some(score) = image_difference(previous, next, candidate)
+            && best.is_none_or(|(_, best_score)| score < best_score)
+        {
+            best = Some((candidate, score));
+        }
+    }
+    best
 }
 
 fn build_row_signatures(
@@ -392,6 +466,17 @@ fn row_signature_difference(left: &[[u8; 3]], right: &[[u8; 3]]) -> u64 {
 
 /// Compares `previous[offset..]` with `next[..height-offset]`.
 fn image_difference(previous: &RgbaImage, next: &RgbaImage, offset: u32) -> Option<f64> {
+    let mut band_scores = image_band_scores(previous, next, offset)?;
+    band_scores.sort_by(f64::total_cmp);
+    band_scores.get(band_scores.len() / 2).copied()
+}
+
+fn frame_has_changed(previous: &RgbaImage, next: &RgbaImage) -> bool {
+    image_band_scores(previous, next, 0)
+        .is_none_or(|scores| scores.into_iter().any(|score| score > 0.0))
+}
+
+fn image_band_scores(previous: &RgbaImage, next: &RgbaImage, offset: u32) -> Option<Vec<f64>> {
     if previous.dimensions() != next.dimensions() || offset >= previous.height() {
         return None;
     }
@@ -422,8 +507,7 @@ fn image_difference(previous: &RgbaImage, next: &RgbaImage, offset: u32) -> Opti
             band_scores.push(score);
         }
     }
-    band_scores.sort_by(f64::total_cmp);
-    band_scores.get(band_scores.len() / 2).copied()
+    (!band_scores.is_empty()).then_some(band_scores)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -678,6 +762,16 @@ mod tests {
         let second = crop_imm(&source, 0, 160, 120, 200).to_image();
         let (offset, score) = find_vertical_offset(&first, &second).unwrap();
         assert_eq!(offset, 160);
+        assert_eq!(score, 0.0);
+    }
+
+    #[test]
+    fn finds_a_small_manual_scroll() {
+        let source = document(120, 500);
+        let first = crop_imm(&source, 0, 0, 120, 200).to_image();
+        let second = crop_imm(&source, 0, 1, 120, 200).to_image();
+        let (offset, score) = find_vertical_offset(&first, &second).unwrap();
+        assert_eq!(offset, 1);
         assert_eq!(score, 0.0);
     }
 
